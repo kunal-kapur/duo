@@ -352,14 +352,19 @@ class TrainerBase(L.LightningModule):
   def generate_samples(self, num_samples, num_steps, eps):
     raise NotImplementedError
 
-  def restore_model_and_sample(self, num_steps, eps=1e-5):
+
+
+
+  # TODO Add logic for taking in input tokens
+  def restore_model_and_sample(self, num_steps, eps=1e-5, input_tokens=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
     samples = self.generate_samples(
       num_samples=self.config.loader.eval_batch_size,
       num_steps=num_steps,
-      eps=eps)
+      eps=eps,
+      input_tokens=input_tokens)
     self._train_mode()
     return samples
 
@@ -493,14 +498,19 @@ class Diffusion(TrainerBase):
   def _ancestral_update(self, x, t, dt, p_x0, noise_removal_step):
     raise NotImplementedError
 
+
+  # TODO Add logic for placing in input tokens in sampling process
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                       eps=1e-5):
+                       eps=1e-5, input_texts=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
-    x = self.prior_sample(num_samples, self.num_tokens)
+    if input_texts is not None:
+      assert len(input_texts) < self.length
+
+    x = self.prior_sample(num_samples, self.num_tokens, input_texts)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -638,10 +648,47 @@ class AbsorbingState(Diffusion):
     if self.ignore_bos:
       xt[:, 0] = x[:, 0]
     return xt
+  
 
-  def prior_sample(self, *batch_dims):
-    return self.mask_index * torch.ones(
-      * batch_dims, dtype=torch.int64, device=self.device)
+  # TODO logic for making sure we add input texts to beginnging of the prior distribution
+  def prior_sample(self, *batch_dims, input_texts=None):
+      """
+      Create a prior tensor of shape (*batch_dims, self.length).
+      If input_texts is provided, their tokenized form is placed
+      at the beginning of each row, with the rest filled with mask_index.
+      If input_texts is None, the entire tensor is filled with mask_index.
+      """
+      if input_texts is None:
+          # Previous logic: just return all masks
+          return self.mask_index * torch.ones(
+              *batch_dims, self.length, dtype=torch.int64, device=self.device
+          )
+
+      # Encoding the inputs to (batch, sequence_length)
+      encoded = self.tokenizer.batch_encode_plus(
+          input_texts,
+          padding='max_length',
+          max_length=self.length,
+          return_tensors="pt"
+      )
+      input_ids = encoded["input_ids"].to(self.device)
+
+      # Make sure batch_dims[0] matches number of input_texts if provided
+      if batch_dims and batch_dims[0] != input_ids.shape[0]:
+          raise ValueError(
+              f"batch_dims[0]={batch_dims[0]} does not match number of input_texts={input_ids.shape[0]}"
+          )
+
+      # Create prior filled with mask tokens
+      prior = self.mask_index * torch.ones_like(input_ids, dtype=torch.int64)
+
+      # Place input_ids at the start of prior
+      for i in range(input_ids.shape[0]):
+          valid_tokens = (input_ids[i] != self.tokenizer.pad_token_id).sum()
+          prior[i, :valid_tokens] = input_ids[i, :valid_tokens]
+
+      return prior
+
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):
