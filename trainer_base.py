@@ -653,15 +653,13 @@ class AbsorbingState(Diffusion):
     return xt
   
 
-  # TODO logic for making sure we add input texts to beginnging of the prior distribution
+    # TODO logic for making sure we add input texts to beginnging of the prior distribution
   def prior_sample(self, *batch_dims, input_texts=None):
       """
-      Create a prior tensor of shape (*batch_dims, self.length).
+      Create a prior tensor of shape (*batch_dims, self.num_tokens).
       If input_texts is provided, their tokenized form is placed
       at the beginning of each row, with the rest filled with mask_index.
-      If input_texts is None, the entire tensor is filled with mask_index.
       """
-
       if input_texts is None:
           # Previous logic: just return all masks
           return self.mask_index * torch.ones(
@@ -673,6 +671,7 @@ class AbsorbingState(Diffusion):
           input_texts,
           padding='max_length',
           max_length=self.num_tokens,
+          add_special_tokens=False,
           return_tensors="pt"
       )
       input_ids = encoded["input_ids"].to(self.device)
@@ -694,7 +693,6 @@ class AbsorbingState(Diffusion):
           prior[i, :valid_tokens] = input_ids[i, :valid_tokens]
 
       return prior
-
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):

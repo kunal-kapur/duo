@@ -26,11 +26,18 @@ def main(config):
   tokenizer=tokenizer)
   print("Model loaded from checkpoint")
 
-  input_texts = ["The quick brown fox "]
+  input_texts = ["A minute later, I started crying like an oversized", 
+                 "Some people, we'll call them “Lucky Motherfuckers",
+"A Japanese man has become the first person to receive",
+"They tell of hearing anti-Semitic epithets and"]
   samples = model.restore_model_and_sample(
       num_steps=config.sampling.steps, input_texts=input_texts)
+  for sample in samples:
+     print("Sample length:", len(sample))
   text_samples = model.tokenizer.batch_decode(samples)
-  print(text_samples)
+  for idx,text_sample in enumerate(text_samples):
+    print(f"\n\n\n\nSample {idx+1}:\n\n")
+    print(text_sample)
 
 
 
