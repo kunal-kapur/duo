@@ -1,5 +1,8 @@
 .DS_Store
 
+# ckpt files
+*.ckpt
+
 .hf_cache
 test/
 outputs/

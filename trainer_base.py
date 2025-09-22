@@ -349,14 +349,14 @@ class TrainerBase(L.LightningModule):
                       'name': 'trainer/lr'}
     return [optimizer], [scheduler_dict]
 
-  def generate_samples(self, num_samples, num_steps, eps):
+  def generate_samples(self, num_samples, num_steps, eps, input_texts=None):
     raise NotImplementedError
 
 
 
 
   # TODO Add logic for taking in input tokens
-  def restore_model_and_sample(self, num_steps, eps=1e-5, input_tokens=None):
+  def restore_model_and_sample(self, num_steps, eps=1e-5, input_texts=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
@@ -364,7 +364,7 @@ class TrainerBase(L.LightningModule):
       num_samples=self.config.loader.eval_batch_size,
       num_steps=num_steps,
       eps=eps,
-      input_tokens=input_tokens)
+      input_texts=input_texts)
     self._train_mode()
     return samples
 
@@ -507,10 +507,13 @@ class Diffusion(TrainerBase):
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
-    if input_texts is not None:
-      assert len(input_texts) < self.length
 
-    x = self.prior_sample(num_samples, self.num_tokens, input_texts)
+    # make sure all texts work 
+    if input_texts is not None:
+      for input_text in input_texts:
+        assert len(input_text) < self.num_tokens
+    print("Sampling on ", input_texts)
+    x = self.prior_sample(num_samples, self.num_tokens, input_texts=input_texts)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -658,17 +661,18 @@ class AbsorbingState(Diffusion):
       at the beginning of each row, with the rest filled with mask_index.
       If input_texts is None, the entire tensor is filled with mask_index.
       """
+
       if input_texts is None:
           # Previous logic: just return all masks
           return self.mask_index * torch.ones(
-              *batch_dims, self.length, dtype=torch.int64, device=self.device
+              *batch_dims, self.num_tokens, dtype=torch.int64, device=self.device
           )
 
       # Encoding the inputs to (batch, sequence_length)
       encoded = self.tokenizer.batch_encode_plus(
           input_texts,
           padding='max_length',
-          max_length=self.length,
+          max_length=self.num_tokens,
           return_tensors="pt"
       )
       input_ids = encoded["input_ids"].to(self.device)
@@ -679,6 +683,8 @@ class AbsorbingState(Diffusion):
               f"batch_dims[0]={batch_dims[0]} does not match number of input_texts={input_ids.shape[0]}"
           )
 
+      print(input_ids)
+      print(input_ids.dtype)
       # Create prior filled with mask tokens
       prior = self.mask_index * torch.ones_like(input_ids, dtype=torch.int64)
 
