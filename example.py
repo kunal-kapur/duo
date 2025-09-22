@@ -17,17 +17,20 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
 @hydra.main(version_base=None, config_path='configs',
             config_name='config')
 def main(config):
-    tokenizer = dataloader.get_tokenizer(config)
-    diffusion_model = MDLM(config=config, tokenizer=tokenizer)
-    model = _load_from_checkpoint(
-    diffusion_model=diffusion_model,
-    config=config,
-    tokenizer=tokenizer)
+  print("Configuration:", config)
+  tokenizer = dataloader.get_tokenizer(config)
+  diffusion_model = MDLM
+  model = _load_from_checkpoint(
+  diffusion_model=diffusion_model,
+  config=config,
+  tokenizer=tokenizer)
+  print("Model loaded from checkpoint")
 
-    samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps)
-    
-    print(samples)
+  input_texts = ["The quick brown fox "]
+  samples = model.restore_model_and_sample(
+      num_steps=config.sampling.steps, input_texts=input_texts)
+  text_samples = model.tokenizer.batch_decode(samples)
+  print(text_samples)
 
 
 
