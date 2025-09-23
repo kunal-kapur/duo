@@ -360,13 +360,13 @@ class TrainerBase(L.LightningModule):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
-    samples = self.generate_samples(
+    samples, boundaries = self.generate_samples(
       num_samples=self.config.loader.eval_batch_size,
       num_steps=num_steps,
       eps=eps,
       input_texts=input_texts)
     self._train_mode()
-    return samples
+    return samples, boundaries
 
   def _process_model_input(self, x0, valid_tokens):
     raise NotImplementedError
@@ -519,6 +519,8 @@ class Diffusion(TrainerBase):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
+    boundaries = set()
+
     for i in range(num_steps):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
@@ -526,8 +528,9 @@ class Diffusion(TrainerBase):
         _, x = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=None)
       elif self.sampler == 'ancestral_cache':
-        p_x0_cache, x_next = self._ancestral_update(
+        p_x0_cache, x_next, new_boundaries = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=p_x0_cache)
+        boundaries.update(new_boundaries)
         if (not torch.allclose(x_next, x)
             or self.time_conditioning):
           # Disable caching
@@ -548,7 +551,7 @@ class Diffusion(TrainerBase):
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
       x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
-    return x
+    return x, boundaries
 
   @torch.no_grad
   def _semi_ar_sampler(
@@ -693,11 +696,22 @@ class AbsorbingState(Diffusion):
           prior[i, :valid_tokens] = input_ids[i, :valid_tokens]
 
       return prior
+  
+  def _normalized_entropy(self, p_xi):
+    """Computes the normalized entropy of a categorical distribution."""
+    p_xi = p_xi + 1e-10
+
+    entropies = - (p_xi * p_xi.log())
+
+    normalized_entropy = entropies.sum(dim=1) / entropies.max(dim=1)[0]
+    return normalized_entropy
+
+
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):
     _, alpha_t = self.noise(t)
-    if noise_removal_step:
+    if noise_removal_step: # don't do this step as we want to gradually unmask
       alpha_s = torch.ones_like(alpha_t)
     else:
       _, alpha_s = self.noise(t - dt)
@@ -706,12 +720,34 @@ class AbsorbingState(Diffusion):
       p_x0 = self.forward(
         x, self._sigma_from_alphat(alpha_t)).exp()
     
-    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None] # unfogging amount
     q_xs[:, :, self.mask_index] = 1 - alpha_s
+
+    # _x is the new distribution of what we are choosing to unmask
     _x = sample_categorical(q_xs)
     
+
+    # will be 1 if we are not a mask index at x
     copy_flag = (x != self.mask_index).to(x.dtype)
-    return p_x0, copy_flag * x + (1 - copy_flag) * _x
+
+    # start with everything initally unmasked and 
+    # then add all indices that are to be masked as well
+
+    boundaries = set()
+    new_x = copy_flag * x + (1 - copy_flag) * _x
+    remaining_unmasked = (new_x == self.mask_index)  #(batch_size, seq_len)
+    indices = remaining_unmasked.nonzero(as_tuple=False)  # (num_masked, 2)
+    for batch_idx, seq_idx in indices:
+        ent = self._normalized_entropy(p_x0[batch_idx, seq_idx])
+        # Left neighbor
+        if seq_idx > 0 and new_x[batch_idx, seq_idx - 1] != self.mask_index and ent > 0.4:
+            boundaries.add((batch_idx.item(), seq_idx.item()))
+        # Right neighbor
+        if seq_idx < new_x.shape[1] - 1 and new_x[batch_idx, seq_idx + 1] != self.mask_index and ent > 0.4:
+            boundaries.add((batch_idx.item(), seq_idx.item() + 1))
+
+
+    return p_x0, copy_flag * x + (1 - copy_flag) * _x, boundaries
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()
