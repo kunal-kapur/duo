@@ -6,7 +6,7 @@ python example.py \
   algo.backbone=hf_dit \
   eval.checkpoint_path="kuleshov-group/mdlm-owt" \
   sampling.steps=2500 \
-  model.length=256 \
+  model.length=128 \
   sampling.predictor=ancestral_cache \
   sampling.num_sample_batches=1 \
   sampling.noise_removal=greedy \
