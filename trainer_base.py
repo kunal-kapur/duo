@@ -349,24 +349,19 @@ class TrainerBase(L.LightningModule):
                       'name': 'trainer/lr'}
     return [optimizer], [scheduler_dict]
 
-  def generate_samples(self, num_samples, num_steps, eps, input_texts=None):
+  def generate_samples(self, num_samples, num_steps, eps):
     raise NotImplementedError
 
-
-
-
-  # TODO Add logic for taking in input tokens
-  def restore_model_and_sample(self, num_steps, eps=1e-5, input_texts=None):
+  def restore_model_and_sample(self, num_steps, eps=1e-5):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
-    samples, boundaries = self.generate_samples(
+    samples = self.generate_samples(
       num_samples=self.config.loader.eval_batch_size,
       num_steps=num_steps,
-      eps=eps,
-      input_texts=input_texts)
+      eps=eps)
     self._train_mode()
-    return samples, boundaries
+    return samples
 
   def _process_model_input(self, x0, valid_tokens):
     raise NotImplementedError
@@ -498,28 +493,18 @@ class Diffusion(TrainerBase):
   def _ancestral_update(self, x, t, dt, p_x0, noise_removal_step):
     raise NotImplementedError
 
-
-  # TODO Add logic for placing in input tokens in sampling process
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                       eps=1e-5, input_texts=None):
+                       eps=1e-5):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
-
-    # make sure all texts work 
-    if input_texts is not None:
-      for input_text in input_texts:
-        assert len(input_text) < self.num_tokens
-    print("Sampling on ", input_texts)
-    x = self.prior_sample(num_samples, self.num_tokens, input_texts=input_texts)
+    x = self.prior_sample(num_samples, self.num_tokens)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
     p_x0_cache = None
-
-    boundaries = set()
 
     for i in range(num_steps):
       t = timesteps[i] * torch.ones(
@@ -528,9 +513,8 @@ class Diffusion(TrainerBase):
         _, x = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=None)
       elif self.sampler == 'ancestral_cache':
-        p_x0_cache, x_next, new_boundaries = self._ancestral_update(
+        p_x0_cache, x_next = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=p_x0_cache)
-        boundaries.update(new_boundaries)
         if (not torch.allclose(x_next, x)
             or self.time_conditioning):
           # Disable caching
@@ -551,7 +535,7 @@ class Diffusion(TrainerBase):
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
       x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
-    return x, boundaries
+    return x
 
   @torch.no_grad
   def _semi_ar_sampler(
@@ -654,69 +638,15 @@ class AbsorbingState(Diffusion):
     if self.ignore_bos:
       xt[:, 0] = x[:, 0]
     return xt
-  
 
-    # TODO logic for making sure we add input texts to beginnging of the prior distribution
-  def prior_sample(self, *batch_dims, input_texts=None):
-      """
-      Create a prior tensor of shape (*batch_dims, self.num_tokens).
-      If input_texts is provided, their tokenized form is placed
-      at the beginning of each row, with the rest filled with mask_index.
-      """
-      if input_texts is None:
-          # Previous logic: just return all masks
-          return self.mask_index * torch.ones(
-              *batch_dims, self.num_tokens, dtype=torch.int64, device=self.device
-          )
-
-      # Encoding the inputs to (batch, sequence_length)
-      encoded = self.tokenizer.batch_encode_plus(
-          input_texts,
-          padding='max_length',
-          max_length=self.num_tokens,
-          add_special_tokens=False,
-          return_tensors="pt"
-      )
-      input_ids = encoded["input_ids"].to(self.device)
-
-      # Make sure batch_dims[0] matches number of input_texts if provided
-      if batch_dims and batch_dims[0] != input_ids.shape[0]:
-          raise ValueError(
-              f"batch_dims[0]={batch_dims[0]} does not match number of input_texts={input_ids.shape[0]}"
-          )
-
-      print(input_ids)
-      print(input_ids.dtype)
-      # Create prior filled with mask tokens
-      prior = self.mask_index * torch.ones_like(input_ids, dtype=torch.int64)
-
-      # Place input_ids at the start of prior
-      for i in range(input_ids.shape[0]):
-          valid_tokens = (input_ids[i] != self.tokenizer.pad_token_id).sum()
-          prior[i, :valid_tokens] = input_ids[i, :valid_tokens]
-
-      return prior
-  
-  def _normalized_entropy(self, p_xi):
-      """Computes the normalized entropy of a categorical distribution."""
-
-      p_xi = p_xi + 1e-10  # (vocab_size,)
-      entropy = - torch.sum(p_xi * torch.log(p_xi))  # scalar
-
-      vocab_size = p_xi.shape[-1]
-
-      # better to normalize by vocab I think?
-      max_entropy = torch.log(torch.tensor(vocab_size, dtype=p_xi.dtype, device=p_xi.device))
-
-      normalized_entropy = entropy / max_entropy
-      return normalized_entropy
-
-
+  def prior_sample(self, *batch_dims):
+    return self.mask_index * torch.ones(
+      * batch_dims, dtype=torch.int64, device=self.device)
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):
     _, alpha_t = self.noise(t)
-    if noise_removal_step: # don't do this step as we want to gradually unmask
+    if noise_removal_step:
       alpha_s = torch.ones_like(alpha_t)
     else:
       _, alpha_s = self.noise(t - dt)
@@ -725,35 +655,12 @@ class AbsorbingState(Diffusion):
       p_x0 = self.forward(
         x, self._sigma_from_alphat(alpha_t)).exp()
     
-    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None] # unfogging amount
+    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
     q_xs[:, :, self.mask_index] = 1 - alpha_s
-
-    # _x is the new distribution of what we are choosing to unmask
     _x = sample_categorical(q_xs)
     
-
-    # will be 1 if we are not a mask index at x
     copy_flag = (x != self.mask_index).to(x.dtype)
-
-    # start with everything initally unmasked and 
-    # then add all indices that are to be masked as well
-
-    boundaries = set()
-    new_x = copy_flag * x + (1 - copy_flag) * _x
-    remaining_unmasked = (new_x == self.mask_index)  #(batch_size, seq_len)
-    indices = remaining_unmasked.nonzero(as_tuple=False)  # (num_masked, 2)
-    for batch_idx, seq_idx in indices:
-        MAX_ENTROPY_THRESH = 0.6
-        ent = self._normalized_entropy(p_x0[batch_idx, seq_idx, :])
-        # Left neighbor
-        if seq_idx > 0 and new_x[batch_idx, seq_idx - 1] != self.mask_index and ent > MAX_ENTROPY_THRESH:
-            boundaries.add((batch_idx.item(), seq_idx.item()))
-        # Right neighbor
-        if seq_idx < new_x.shape[1] - 1 and new_x[batch_idx, seq_idx + 1] != self.mask_index and ent > MAX_ENTROPY_THRESH:
-            boundaries.add((batch_idx.item(), seq_idx.item() + 1))
-
-
-    return p_x0, copy_flag * x + (1 - copy_flag) * _x, boundaries
+    return p_x0, copy_flag * x + (1 - copy_flag) * _x
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()
