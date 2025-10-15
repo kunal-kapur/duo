@@ -221,6 +221,8 @@ def main(config):
     diffusion_model = algo.AR
   elif config.algo.name == 'mdlm':
     diffusion_model = algo.MDLM
+  elif config.algo.name == 'mdlm_segmentation':
+    diffusion_model = algo.MDLMSegmentation
   elif config.algo.name == 'duo_base':
     diffusion_model = algo.DUO_BASE
   elif config.algo.name == 'd3pm':

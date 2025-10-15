@@ -12,7 +12,7 @@
 #SBATCH --open-mode=append            # Do not overwrite logs
 #SBATCH --requeue                     # Requeue upon preemption
 
-checkpoint_path=/share/kuleshov/ssahoo/textdiffusion/mdlm.ckpt
+checkpoint_path=/home/kkapur/models_files/mdlm.ckpt
 
 export HYDRA_FULL_ERROR=1
 
@@ -23,6 +23,6 @@ srun python -u -m main \
   data=openwebtext-split \
   model=small \
   algo=mdlm \
-  eval.checkpoint_path=/share/kuleshov/ssahoo/textdiffusion/mdlm.ckpt \
+  eval.checkpoint_path=/home/kkapur/models_files/mdlm.ckpt \
   sampling.num_sample_batches=4 \
   +wandb.offline=true

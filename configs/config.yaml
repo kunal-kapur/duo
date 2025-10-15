@@ -23,7 +23,7 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic
+  predictor: ancestral_cache  # ancestral_cache (only for MDLM), ancestral, analytic
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
