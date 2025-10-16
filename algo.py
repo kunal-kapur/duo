@@ -103,9 +103,9 @@ class MDLM(trainer_base.AbsorbingState):
     # For the logits of the unmasked tokens, set all values
     # to -infinity except for the indices corresponding to
     # the unmasked tokens.
-    unmasked_indices = (xt != self.mask_index)
-    model_output[unmasked_indices] = self.neg_infinity
-    model_output[unmasked_indices, xt[unmasked_indices]] = 0
+    unmasked_indices = (xt != self.mask_index) # [B x T]
+    model_output[unmasked_indices] = self.neg_infinity # [B x T x V] = -inf
+    model_output[unmasked_indices, xt[unmasked_indices]] = 0 # 
     return model_output
 
   def nll_per_token(self, log_x_theta, xt, x0, alpha_t,
@@ -242,7 +242,6 @@ class MDLMSegmentation(MDLM):
         p = torch.clamp(p, min=eps)
         q = torch.clamp(q, min=eps)
 
-        # KL(p || q) = sum p * log(p / q)
         kl = p * (torch.log(p) - torch.log(q))
 
         # Sum over vocab_size and T, results in a tensor of shape [B]
@@ -305,48 +304,39 @@ class MDLMSegmentation(MDLM):
       segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
       copy_index = (x != self.mask_index).to(x.dtype)
       segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments
-
       B, num_segments, T = segments.shape
-      
+
       kl_scores_list = []
-      
       sigma = self._sigma_from_alphat(alpha_t)
 
+      # Iterate over segments to avoid memory explosion
       for i in range(num_segments):
-          # Get the current segment for all items in the batch -> [B, T]
-          current_segment = segments[:, i, :]
-
-          # Perform the forward pass on just this small [B, T] batch
-          p_x0_segment_i = self.forward(current_segment, sigma).exp()
-
-          # Calculate the KL divergence for this single segment's output
-          # The result will have a shape of [B]
-          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i)
-          
-          # Add the score to our list
+          current_segment = segments[:, i, :]  # [B, T]
+          p_x0_segment_i = self.forward(current_segment, sigma).exp()  # [B, T, V]
+          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i)  # [B]
           kl_scores_list.append(kl_score_i)
 
-      # [B, num_segments]
+      # Stack KL scores per segment -> [B, num_segments]
       kl_scores = torch.stack(kl_scores_list, dim=1)
-      
-      TEMP = 1.0  # controls sharpness of importance weighting
-      BETA = 0.0  # controls how strongly importance affects scaling
 
-      # Segment importance: normalized weights
-      differences_normalized = torch.nn.Softmax(dim=-1)(kl_scores / TEMP)
-      differences_expanded = differences_normalized.unsqueeze(-1)  # [B, num_segments, 1]
+      TEMP = 1.0   # controls sharpness of softmax weighting
+      BETA = 0.5   # controls how strongly weights scale logits (try between 0.1–1.0)
 
-      # Map to tokens
+      # Normalize KL scores across segments (per batch)
+      segment_weights = torch.softmax(kl_scores / TEMP, dim=-1)  # [B, num_segments]
+      segment_weights_expanded = segment_weights.unsqueeze(-1)   # [B, num_segments, 1]
+
+      # Map segment weights back to token level
       segment_mask_bool = (segments == self.mask_index)
-      token_probs = differences_expanded * segment_mask_bool.to(differences_expanded.dtype)
-      token_probs_per_position = token_probs.sum(dim=1)
-      token_probs_per_position = token_probs_per_position / (
-          token_probs_per_position.sum(dim=-1, keepdim=True) + 1e-8
-      )
+      token_weights = (segment_weights_expanded * segment_mask_bool.to(segment_weights_expanded.dtype)).sum(dim=1)
+      token_weights = token_weights / (token_weights.sum(dim=-1, keepdim=True) + 1e-8)  # normalize per sequence
 
-      # Apply importance weighting smoothly
-      p_x0_modified = p_x0 * (1 + BETA * token_probs_per_position.unsqueeze(-1))
-      p_x0_modified = self._process_model_output(p_x0_modified, x, alpha_t).exp()
+      # multiply weights 
+      p_x0_weighted = p_x0 * (1 + BETA * token_weights.unsqueeze(-1))
+      p_x0_weighted = p_x0_weighted / (p_x0_weighted.sum(dim=-1, keepdim=True) + 1e-8)  # renormalize to valid probs
+
+      # Reprocess for consistency
+      p_x0_modified = self._process_model_output(p_x0_weighted, x, alpha_t).exp()
       return p_x0_modified
 
 
