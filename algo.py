@@ -263,26 +263,26 @@ class MDLMSegmentation(MDLM):
       x = self.prior_sample(num_samples, self.num_tokens)
       timesteps = torch.linspace(
         1, eps, num_steps + 1, device=self.device)
+      
+      p_segment = torch.linspace(0.6, 0.0, num_steps, device=self.device)
+
       dt = (1 - eps) / num_steps
       p_x0_cache = None
 
       for i in range(num_steps):
         t = timesteps[i] * torch.ones(
           x.shape[0], 1, device=self.device)
-        if self.sampler == 'ancestral':
-          _, x = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=None)
-        elif self.sampler == 'ancestral_cache':
+        p_segment_current = p_segment[i]
+        if self.sampler == 'ancestral_cache':
           p_x0_cache, x_next = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache)
+            x=x, t=t, dt=dt, p_x0=p_x0_cache, p_segment=p_segment_current)
           if (not torch.allclose(x_next, x)
               or self.time_conditioning):
             # Disable caching
             p_x0_cache = None
           x = x_next
         else:
-          x = self._analytic_update(x=x,t=t, dt=dt)
-
+          raise ValueError("Should have ancestral cache")
       t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
                                       device=self.device)
       
@@ -292,87 +292,83 @@ class MDLMSegmentation(MDLM):
         else:
           _, x = self._ancestral_update(x=x, t=t0, dt=None,
                                   p_x0=p_x0_cache,
-                                  noise_removal_step=True)
+                                  noise_removal_step=True, p_segment=0.0)
       elif self.config.sampling.noise_removal == 'greedy':
         sigma = self._sigma_from_alphat(self.noise(t0)[1])
         x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
       return x
+    
+
+    def modify_distribution_with_segments(self, x, p_x0, alpha_t, alpha_s, p_segment):
+              # Sample with mask token probability as one
+        alpha_s_dummy = torch.ones_like(alpha_s)
+        q_xs = p_x0 * alpha_s_dummy[:, :, None]
+        q_xs[:, :, self.mask_index] = 0
+        _x_all = sample_categorical(q_xs)
+        segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
+        copy_index = (x != self.mask_index).to(x.dtype)
+        segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments # for each segment maintain current copied tokens
+
+        B, num_segments, T = segments.shape
+        segments_flat = segments.view(B * num_segments, T)
+        # Forward pass (example)
+        p_x0_segments = self.forward(
+            segments_flat, 
+            self._sigma_from_alphat(alpha_t)
+        ).exp()
+        p_x0_segments = p_x0_segments.view(B, num_segments, -1, T)
+        kl_scores = self.kl_divergence(p_x0, p_x0_segments)
+
+        TEMP = 1.0  # controls sharpness of importance weighting
+        BETA = 1.0  # controls how strongly importance affects scaling
+
+        # Segment importance → normalized weights
+        differences_normalized = torch.nn.Softmax(dim=-1)(kl_scores / TEMP)
+        differences_expanded = differences_normalized.unsqueeze(-1)  # [B, num_segments, 1]
+
+        # Map to tokens
+        segment_mask_bool = (segments == self.mask_index)
+        token_probs = differences_expanded * segment_mask_bool.to(differences_expanded.dtype)
+        token_probs_per_position = token_probs.sum(dim=1) # can do this since each position in a segment should be masked a total of once 
+        token_probs_per_position = token_probs_per_position / (
+            token_probs_per_position.sum(dim=-1, keepdim=True) + 1e-8
+        )
+
+        # Apply importance weighting smoothly
+        p_x0_modified = p_x0 * (1 + BETA * token_probs_per_position.unsqueeze(-1))
+        p_x0_modified = self._process_model_output(p_x0_modified, x, alpha_t).exp() # normalize
+        return p_x0_modified
+
 
 
     def _ancestral_update(self, x, t, dt, p_x0=None,
-                    noise_removal_step=False):
-      _, alpha_t = self.noise(t)
-      if noise_removal_step:
-        alpha_s = torch.ones_like(alpha_t)
-      else:
-        _, alpha_s = self.noise(t - dt)
-      assert alpha_t.ndim == 2
+                    noise_removal_step=False, p_segment=None):
+        _, alpha_t = self.noise(t)
+        if noise_removal_step:
+          alpha_s = torch.ones_like(alpha_t)
+        else:
+          _, alpha_s = self.noise(t - dt)
+        assert alpha_t.ndim == 2
 
       # we create segments here
       # linearly interpolate p_segment between start and end as t increases (0..1)
-
-
-      eps = 1e-5 # MAY HAVE TO FIX THIS?
-      p_segment_start = 0.6
-      p_segment_lower = 0.1
-      # I need some way to interplate
-      p_segment = (
-        p_segment_lower
-        + (p_segment_start - p_segment_lower) * (t - eps) / (1 - eps)
-      )
       
       # FORWARD PASS HERE
-      if p_x0 is None:
-        # do a forward here
-        p_x0 = self.forward(
-          x, self._sigma_from_alphat(alpha_t)).exp()
-        
-      # Sample with mask token probability as one
-      alpha_s_dummy = torch.ones_like(alpha_s)
-      q_xs = p_x0 * alpha_s_dummy[:, :, None]
-      q_xs[:, :, self.mask_index] = 0
-      _x_all = sample_categorical(q_xs)
-      segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
-      copy_index = (x != self.mask_index).to(x.dtype)
-      segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments # for each segment maintain current copied tokens
+        if p_x0 is None:
+          # do a forward here
+          p_x0 = self.forward(
+            x, self._sigma_from_alphat(alpha_t)).exp()
+          if p_segment != 0 and p_segment is not None:
+              p_x0 = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, p_segment)
 
-      B, num_segments, T = segments.shape
-      segments_flat = segments.view(B * num_segments, T)
-      # Forward pass (example)
-      p_x0_segments = self.forward(
-          segments_flat, 
-          self._sigma_from_alphat(alpha_t)
-      ).exp()
-      p_x0_segments = p_x0_segments.view(B, num_segments, -1, T)
-      kl_scores = self.kl_divergence(p_x0, p_x0_segments)
+        # True Diffusion update
+        q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+        q_xs[:, :, self.mask_index] = 1 - alpha_s
 
-      TEMP = 1.0  # controls sharpness of importance weighting
-      BETA = 1.0  # controls how strongly importance affects scaling
-
-      # Segment importance → normalized weights
-      differences_normalized = torch.nn.Softmax(dim=-1)(kl_scores / TEMP)
-      differences_expanded = differences_normalized.unsqueeze(-1)  # [B, num_segments, 1]
-
-      # Map to tokens
-      segment_mask_bool = (segments == self.mask_index)
-      token_probs = differences_expanded * segment_mask_bool.to(differences_expanded.dtype)
-      token_probs_per_position = token_probs.sum(dim=1) # can do this since each position in a segment should be masked a total of once 
-      token_probs_per_position = token_probs_per_position / (
-          token_probs_per_position.sum(dim=-1, keepdim=True) + 1e-8
-      )
-
-      # Apply importance weighting smoothly
-      p_x0_modified = p_x0 * (1 + BETA * token_probs_per_position.unsqueeze(-1))
-      p_x0_modified = self._process_model_output(p_x0_modified, x, alpha_t).exp() # normalize
-
-      # True Diffusion update
-      q_xs = p_x0_modified * (alpha_s - alpha_t)[:, :, None]
-      q_xs[:, :, self.mask_index] = 1 - alpha_s
-
-      _x = sample_categorical(q_xs)
-      copy_flag = (x != self.mask_index).to(x.dtype)
-      return p_x0, copy_flag * x + (1 - copy_flag) * _x
-  
+        _x = sample_categorical(q_xs)
+        copy_flag = (x != self.mask_index).to(x.dtype)
+        return p_x0, copy_flag * x + (1 - copy_flag) * _x
+    
 
 class MDLMSegmentation(MDLM):
     def __init__(self, config, tokenizer):
