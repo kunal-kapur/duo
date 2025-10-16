@@ -225,30 +225,28 @@ class MDLMSegmentation(MDLM):
         segment_boundaries = torch.stack([starts, ends], dim=1)  # [num_segments, 2]
         return batch_seg_masked, segment_boundaries
 
+    @staticmethod
     def kl_divergence(p, q, eps=1e-8):
         """
         Compute the Kullback-Leibler (KL) divergence D_KL(p || q) for batched distributions.
 
         Args:
             p: tensor [B, T, vocab_size], the target distribution (P)
-            q: tensor [B, num_segments, T, vocab_size], the proposal distribution (Q)
+            q: tensor [B, T, vocab_size], the proposal distribution (Q)
             eps: small constant for numerical stability (to prevent log(0))
 
         Returns:
-            divergence: tensor [B, num_segments] with KL divergence summed across T and vocab_size
+            divergence: tensor [B] with KL divergence summed across T and vocab_size
         """
         # Ensure numerical stability
         p = torch.clamp(p, min=eps)
         q = torch.clamp(q, min=eps)
 
-        # Match shapes: expand p to [B, num_segments, T, vocab_size]
-        p_expanded = p.unsqueeze(1).expand_as(q)
-
         # KL(p || q) = sum p * log(p / q)
-        kl = p_expanded * (torch.log(p_expanded) - torch.log(q))
+        kl = p * (torch.log(p) - torch.log(q))
 
-        # Sum over vocab_size and T
-        kl_sum = kl.sum(dim=(-1, -2))  # [B, num_segments]
+        # Sum over vocab_size and T, results in a tensor of shape [B]
+        kl_sum = kl.sum(dim=(-1, -2))
         return kl_sum
 
     # I need to create own generate samples to avoid computing on each forward pass
@@ -264,7 +262,7 @@ class MDLMSegmentation(MDLM):
         1, eps, num_steps + 1, device=self.device)
       
       # TODO make parameter in config to adjust the segment probability thresholds
-      p_segment = torch.linspace(0.6, 0.0, num_steps, device=self.device)
+      p_segment = torch.linspace(0.3, 0.0, num_steps, device=self.device)
 
       dt = (1 - eps) / num_steps
       p_x0_cache = None
@@ -300,43 +298,56 @@ class MDLMSegmentation(MDLM):
     
  
     def modify_distribution_with_segments(self, x, p_x0, alpha_t, alpha_s, p_segment):
-        alpha_s_dummy = torch.ones_like(alpha_s)
-        q_xs = p_x0 * alpha_s_dummy[:, :, None]
-        q_xs[:, :, self.mask_index] = 0
-        _x_all = sample_categorical(q_xs)
-        segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
-        copy_index = (x != self.mask_index).to(x.dtype)
-        segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments # for each segment maintain current copied tokens
+      alpha_s_dummy = torch.ones_like(alpha_s)
+      q_xs = p_x0 * alpha_s_dummy[:, :, None]
+      q_xs[:, :, self.mask_index] = 0
+      _x_all = sample_categorical(q_xs)
+      segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
+      copy_index = (x != self.mask_index).to(x.dtype)
+      segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments
 
-        B, num_segments, T = segments.shape
-        segments_flat = segments.view(B * num_segments, T)
-        # Forward pass (example)
-        p_x0_segments = self.forward(
-            segments_flat, 
-            self._sigma_from_alphat(alpha_t)
-        ).exp()
-        p_x0_segments = p_x0_segments.view(B, num_segments, -1, T)
-        kl_scores = self.kl_divergence(p_x0, p_x0_segments)
+      B, num_segments, T = segments.shape
+      
+      kl_scores_list = []
+      
+      sigma = self._sigma_from_alphat(alpha_t)
 
-        TEMP = 1.0  # controls sharpness of importance weighting
-        BETA = 1.0  # controls how strongly importance affects scaling
+      for i in range(num_segments):
+          # Get the current segment for all items in the batch -> [B, T]
+          current_segment = segments[:, i, :]
 
-        # Segment importance → normalized weights
-        differences_normalized = torch.nn.Softmax(dim=-1)(kl_scores / TEMP)
-        differences_expanded = differences_normalized.unsqueeze(-1)  # [B, num_segments, 1]
+          # Perform the forward pass on just this small [B, T] batch
+          p_x0_segment_i = self.forward(current_segment, sigma).exp()
 
-        # Map to tokens
-        segment_mask_bool = (segments == self.mask_index)
-        token_probs = differences_expanded * segment_mask_bool.to(differences_expanded.dtype)
-        token_probs_per_position = token_probs.sum(dim=1) # can do this since each position in a segment should be masked a total of once 
-        token_probs_per_position = token_probs_per_position / (
-            token_probs_per_position.sum(dim=-1, keepdim=True) + 1e-8
-        )
+          # Calculate the KL divergence for this single segment's output
+          # The result will have a shape of [B]
+          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i)
+          
+          # Add the score to our list
+          kl_scores_list.append(kl_score_i)
 
-        # Apply importance weighting smoothly
-        p_x0_modified = p_x0 * (1 + BETA * token_probs_per_position.unsqueeze(-1))
-        p_x0_modified = self._process_model_output(p_x0_modified, x, alpha_t).exp() # normalize
-        return p_x0_modified
+      # [B, num_segments]
+      kl_scores = torch.stack(kl_scores_list, dim=1)
+      
+      TEMP = 1.0  # controls sharpness of importance weighting
+      BETA = 0.0  # controls how strongly importance affects scaling
+
+      # Segment importance: normalized weights
+      differences_normalized = torch.nn.Softmax(dim=-1)(kl_scores / TEMP)
+      differences_expanded = differences_normalized.unsqueeze(-1)  # [B, num_segments, 1]
+
+      # Map to tokens
+      segment_mask_bool = (segments == self.mask_index)
+      token_probs = differences_expanded * segment_mask_bool.to(differences_expanded.dtype)
+      token_probs_per_position = token_probs.sum(dim=1)
+      token_probs_per_position = token_probs_per_position / (
+          token_probs_per_position.sum(dim=-1, keepdim=True) + 1e-8
+      )
+
+      # Apply importance weighting smoothly
+      p_x0_modified = p_x0 * (1 + BETA * token_probs_per_position.unsqueeze(-1))
+      p_x0_modified = self._process_model_output(p_x0_modified, x, alpha_t).exp()
+      return p_x0_modified
 
 
     def _ancestral_update(self, x, t, dt, p_x0=None,
