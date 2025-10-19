@@ -4,8 +4,8 @@ python main.py \
   loader.eval_batch_size=2 \
   data=openwebtext-split \
   algo=mdlm_segmentation \
-  eval.checkpoint_path=/home/kkapur/models_files/mdlm.ckpt  \
-  sampling.steps=8 \
+  eval.checkpoint_path=/home/ubuntu/kkapur-v2/models/mdlm.ckpt  \
+  sampling.steps=500 \
   sampling.num_sample_batches=1 \
   +wandb.offline=true 
 
@@ -16,7 +16,7 @@ python main.py \
   loader.eval_batch_size=8 \
   data=openwebtext-split \
   algo=mdlm \
-  eval.checkpoint_path=/home/kkapur/models_files/mdlm.ckpt  \
-  sampling.steps=8 \
+  eval.checkpoint_path=/home/ubuntu/kkapur-v2/models/mdlm.ckpt  \
+  sampling.steps=1000 \
   sampling.num_sample_batches=1 \
   +wandb.offline=true 

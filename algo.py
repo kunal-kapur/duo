@@ -252,7 +252,7 @@ class MDLMSegmentation(MDLM):
         1, eps, num_steps + 1, device=self.device)
       
       # TODO make parameter in config to adjust the segment probability thresholds
-      p_segment = torch.linspace(0.3, 0.0, num_steps, device=self.device)
+      
 
       dt = (1 - eps) / num_steps
       p_x0_cache = None
@@ -260,10 +260,9 @@ class MDLMSegmentation(MDLM):
       for i in range(num_steps):
         t = timesteps[i] * torch.ones(
           x.shape[0], 1, device=self.device)
-        p_segment_current = p_segment[i]
         if self.sampler == 'ancestral_cache':
           p_x0_cache, x_next = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache, p_segment=p_segment_current)
+            x=x, t=t, dt=dt, p_x0=p_x0_cache, num_segments=4)
           if (not torch.allclose(x_next, x)
               or self.time_conditioning):
             # Disable caching
@@ -280,7 +279,7 @@ class MDLMSegmentation(MDLM):
         else:
           _, x = self._ancestral_update(x=x, t=t0, dt=None,
                                   p_x0=p_x0_cache,
-                                  noise_removal_step=True, p_segment=None)
+                                  noise_removal_step=True, num_segments=None)
       elif self.config.sampling.noise_removal == 'greedy':
         sigma = self._sigma_from_alphat(self.noise(t0)[1])
         x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
@@ -316,13 +315,17 @@ class MDLMSegmentation(MDLM):
 
       # Stack KL scores per segment: [B, num_segments]
       kl_scores = torch.stack(kl_scores_list, dim=1)
-      TEMP = 10.0  # higher = more spiky
+
+      # print("KL scores", kl_scores.shape)
+      TEMP = 3  # higher = more spiky
       segment_mask_bool = (segments == self.mask_index)  # [B, num_segments, T]
 
       # should be fine since we only have at most 1 index that is non-masked per segment
       token_weights = (kl_scores.unsqueeze(-1) * segment_mask_bool.to(kl_scores.dtype)).sum(dim=1)  # [B, T]
       # Apply softmax across tokens to make it a proper weighting distribution
       token_weights = torch.softmax(token_weights / TEMP, dim=-1)
+
+      # print("token shape", token_weights.shape)
       return p_x0, token_weights.squeeze(-1)
 
 
@@ -346,9 +349,16 @@ class MDLMSegmentation(MDLM):
           if num_segments != 0 and num_segments is not None:
               p_x0, m_t = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
 
+        if m_t is None:
+          m_t = 1
         # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
-        BETA = 0.1 # effects how much we choose to bias by
-        q_xs = p_x0 * m_t * (alpha_s - alpha_t)[:, :, None]
+        BETA = 0 # effects how much we choose to bias by
+        q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+
+        # print("q_xs before mask", q_xs.shape)
+        if type(m_t) == type(q_xs):
+          pass
+          # print("m_t shape", m_t.shape)
         q_xs[:, :, self.mask_index] = (1 - alpha_s) * (1 - BETA * m_t)
 
         _x = sample_categorical(q_xs)
