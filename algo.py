@@ -178,75 +178,66 @@ class MDLMSegmentation(MDLM):
       self._validate_configuration()
 
 
-    def create_mask_segment_batch(self, xt, p_segment):
+    def create_mask_segment_batch(self, xt, total_segments):
         """
-        Create a batch of masked segments based on the input and segment probability.
+        Randomly split sequence into exactly `total_segments` contiguous segments.
 
         Args:
-            xt (torch.LongTensor): [B, T] the current generated input
-            p_segment (float): the probability of starting a new segment
+            xt (torch.LongTensor): [B, T] input tensor.
+            total_segments (int): number of distinct contiguous segments.
 
         Returns:
-            batch_seg_masked (torch.LongTensor): [B, num_segments, T] where
-                - positions inside each segment are replaced by self.mask_index
-                - all other positions retain original tokens
-            segment_boundaries (torch.LongTensor): [num_segments, 2] start and end indices
+            batch_seg_masked (torch.LongTensor): [B, total_segments, T]
+                Each segment has masked tokens inside that segment.
+            segment_boundaries (torch.LongTensor): [total_segments, 2]
+                Start and end indices (end exclusive) for each segment.
         """
         B, T = xt.shape
         device = xt.device
 
-        mask = torch.rand(T, device=device) < p_segment
+        if total_segments > T:
+            raise ValueError(f"total_segments ({total_segments}) cannot exceed sequence length ({T}).")
 
-        # this should always ensure we end up with some segment
-        mask[0] = True   # always start
+        # Randomly choose k-1 cut points in range [1, T-1)
+        cut_points = torch.randperm(T - 1, device=device)[:total_segments - 1]
+        cut_points, _ = torch.sort(cut_points)
 
-
-        starts = mask.nonzero(as_tuple=True)[0] # indices of starts
-
-        # end of segment should not be inclusive 
-        ends = torch.cat([starts[1:], torch.tensor([T], device=device)])  # exclusive end indices
-        num_segments = len(starts)
+        # Include start and end points
+        starts = torch.cat([torch.tensor([0], device=device), cut_points])
+        ends = torch.cat([cut_points, torch.tensor([T], device=device)])
 
         segment_range = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
-
-        # place to put segments
         seg_masks = (segment_range >= starts.unsqueeze(1)) & (segment_range < ends.unsqueeze(1))  # [num_segments, T]
 
+        xt_expanded = xt.unsqueeze(1).expand(B, total_segments, T)  # [B, num_segments, T]
 
-        xt_expanded = xt.unsqueeze(1).expand(B, num_segments, T)  # [B, num_segments, T]
-
-        # For each segment: replace *inside* segment with mask_index
+        # Replace positions inside each segment with mask_index
         batch_seg_masked = torch.where(
-            seg_masks.unsqueeze(0),  # broadcast to [B, num_segments, T]
-            torch.full_like(xt_expanded, self.mask_index), # tensor full of masks
-            xt_expanded # otherwise original value
+            seg_masks.unsqueeze(0), 
+            torch.full_like(xt_expanded, self.mask_index),
+            xt_expanded
         )
 
         segment_boundaries = torch.stack([starts, ends], dim=1)  # [num_segments, 2]
         return batch_seg_masked, segment_boundaries
 
+
     @staticmethod
     def kl_divergence(p, q, eps=1e-8):
         """
-        Compute the Kullback-Leibler (KL) divergence D_KL(p || q) for batched distributions.
+        Compute KL divergence D_KL(p || q) per token.
 
         Args:
-            p: tensor [B, T, vocab_size], the target distribution (P)
-            q: tensor [B, T, vocab_size], the proposal distribution (Q)
-            eps: small constant for numerical stability (to prevent log(0))
-
+            p: [B, T, V]
+            q: [B, T, V]
         Returns:
-            divergence: tensor [B] with KL divergence summed across T and vocab_size
+            kl_tokenwise: [B, T] KL divergence per token.
         """
-        # Ensure numerical stability
         p = torch.clamp(p, min=eps)
         q = torch.clamp(q, min=eps)
-
         kl = p * (torch.log(p) - torch.log(q))
+        return kl.sum(dim=-1)  # [B, T]
 
-        # Sum over vocab_size and T, results in a tensor of shape [B]
-        kl_sum = kl.sum(dim=(-1, -2))
-        return kl_sum
 
     # I need to create own generate samples to avoid computing on each forward pass
     @torch.no_grad()
@@ -296,52 +287,47 @@ class MDLMSegmentation(MDLM):
       return x
     
  
-    def modify_distribution_with_segments(self, x, p_x0, alpha_t, alpha_s, p_segment):
+    def modify_distribution_with_segments(self, x, p_x0, alpha_t, alpha_s, num_segments):
+      
+      # dummy sampling to sample the all of p_x0
       alpha_s_dummy = torch.ones_like(alpha_s)
       q_xs = p_x0 * alpha_s_dummy[:, :, None]
       q_xs[:, :, self.mask_index] = 0
       _x_all = sample_categorical(q_xs)
-      segments, segment_boundaries = self.create_mask_segment_batch(_x_all, p_segment)
-      copy_index = (x != self.mask_index).to(x.dtype)
+      segments, segment_boundaries = self.create_mask_segment_batch(_x_all, num_segments)
+
+      copy_index = (x != self.mask_index).to(x.dtype) # we maintain the ones that are unmasked
       segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments
       B, num_segments, T = segments.shape
 
       kl_scores_list = []
       sigma = self._sigma_from_alphat(alpha_t)
 
-      # Iterate over segments to avoid memory explosion
+      # Iterate through segments for now to avoid memory explosion for now
+      mask = (x == self.mask_index)  # which tokens are masked
       for i in range(num_segments):
           current_segment = segments[:, i, :]  # [B, T]
           p_x0_segment_i = self.forward(current_segment, sigma).exp()  # [B, T, V]
-          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i)  # [B]
+          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i) # [B, T]
+
+          # only calculate difference on masked indices
+          kl_score_i = (kl_score_i * mask).sum(-1) / (mask.sum(-1) + 1e-8)
           kl_scores_list.append(kl_score_i)
 
-      # Stack KL scores per segment -> [B, num_segments]
+      # Stack KL scores per segment: [B, num_segments]
       kl_scores = torch.stack(kl_scores_list, dim=1)
+      TEMP = 10.0  # higher = more spiky
+      segment_mask_bool = (segments == self.mask_index)  # [B, num_segments, T]
 
-      TEMP = 1.0   # controls sharpness of softmax weighting
-      BETA = 0.5   # controls how strongly weights scale logits (try between 0.1–1.0)
-
-      # Normalize KL scores across segments (per batch)
-      segment_weights = torch.softmax(kl_scores / TEMP, dim=-1)  # [B, num_segments]
-      segment_weights_expanded = segment_weights.unsqueeze(-1)   # [B, num_segments, 1]
-
-      # Map segment weights back to token level
-      segment_mask_bool = (segments == self.mask_index)
-      token_weights = (segment_weights_expanded * segment_mask_bool.to(segment_weights_expanded.dtype)).sum(dim=1)
-      token_weights = token_weights / (token_weights.sum(dim=-1, keepdim=True) + 1e-8)  # normalize per sequence
-
-      # multiply weights 
-      p_x0_weighted = p_x0 * (1 + BETA * token_weights.unsqueeze(-1))
-      p_x0_weighted = p_x0_weighted / (p_x0_weighted.sum(dim=-1, keepdim=True) + 1e-8)  # renormalize to valid probs
-
-      # Reprocess for consistency
-      p_x0_modified = self._process_model_output(p_x0_weighted, x, alpha_t).exp()
-      return p_x0_modified
+      # should be fine since we only have at most 1 index that is non-masked per segment
+      token_weights = (kl_scores.unsqueeze(-1) * segment_mask_bool.to(kl_scores.dtype)).sum(dim=1)  # [B, T]
+      # Apply softmax across tokens to make it a proper weighting distribution
+      token_weights = torch.softmax(token_weights / TEMP, dim=-1)
+      return p_x0, token_weights.squeeze(-1)
 
 
     def _ancestral_update(self, x, t, dt, p_x0=None,
-                    noise_removal_step=False, p_segment=None):
+                    noise_removal_step=False, num_segments=None, m_t=None):
         _, alpha_t = self.noise(t)
         if noise_removal_step:
           alpha_s = torch.ones_like(alpha_t)
@@ -353,16 +339,17 @@ class MDLMSegmentation(MDLM):
       # linearly interpolate p_segment between start and end as t increases (0..1)
       
       # FORWARD PASS HERE
-        if p_x0 is None:
+        if p_x0 is None or m_t is None:
           # do a forward here
           p_x0 = self.forward(
             x, self._sigma_from_alphat(alpha_t)).exp()
-          if p_segment != 0 and p_segment is not None:
-              p_x0 = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, p_segment)
+          if num_segments != 0 and num_segments is not None:
+              p_x0, m_t = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
 
-        # True Diffusion update
-        q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-        q_xs[:, :, self.mask_index] = 1 - alpha_s
+        # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
+        BETA = 0.1 # effects how much we choose to bias by
+        q_xs = p_x0 * m_t * (alpha_s - alpha_t)[:, :, None]
+        q_xs[:, :, self.mask_index] = (1 - alpha_s) * (1 - BETA * m_t)
 
         _x = sample_categorical(q_xs)
         copy_flag = (x != self.mask_index).to(x.dtype)
