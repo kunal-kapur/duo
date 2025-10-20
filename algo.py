@@ -262,7 +262,7 @@ class MDLMSegmentation(MDLM):
           x.shape[0], 1, device=self.device)
         if self.sampler == 'ancestral_cache':
           p_x0_cache, x_next = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache, num_segments=4)
+            x=x, t=t, dt=dt, p_x0=p_x0_cache, num_segments=10)
           if (not torch.allclose(x_next, x)
               or self.time_conditioning):
             # Disable caching
@@ -300,24 +300,31 @@ class MDLMSegmentation(MDLM):
       B, num_segments, T = segments.shape
 
       kl_scores_list = []
+      mask = (x == self.mask_index).float()  # [B, T]
       sigma = self._sigma_from_alphat(alpha_t)
 
-      # Iterate through segments for now to avoid memory explosion for now
-      mask = (x == self.mask_index)  # which tokens are masked
-      for i in range(num_segments):
-          current_segment = segments[:, i, :]  # [B, T]
-          p_x0_segment_i = self.forward(current_segment, sigma).exp()  # [B, T, V]
-          kl_score_i = self.kl_divergence(p_x0, p_x0_segment_i) # [B, T]
+      flat_segments = segments.reshape(B * num_segments, T)
+      flat_sigma = sigma.repeat_interleave(num_segments, dim=0)  # [B*num_segments, ...]
 
-          # only calculate difference on masked indices
-          kl_score_i = (kl_score_i * mask).sum(-1) / (mask.sum(-1) + 1e-8)
-          kl_scores_list.append(kl_score_i)
+      # Forward pass in batch
+      p_x0_segments = self.forward(flat_segments, flat_sigma).exp()  # [B*num_segments, T, V]
 
-      # Stack KL scores per segment: [B, num_segments]
-      kl_scores = torch.stack(kl_scores_list, dim=1)
+      # Unflatten
+      _, T, V = p_x0_segments.shape
+      p_x0_segments = p_x0_segments.view(B, num_segments, T, V)
+      p_x0_expanded = p_x0.unsqueeze(1).expand(B, num_segments, T, V)
 
-      # print("KL scores", kl_scores.shape)
-      TEMP = 3  # higher = more spiky
+      eps = 1e-8
+      p = torch.clamp(p_x0_expanded, min=eps)
+      q = torch.clamp(p_x0_segments, min=eps)
+      kl = p * (torch.log(p) - torch.log(q))
+      kl_tokenwise = kl.sum(dim=-1)  # [B, num_segments, T]
+
+      mask = mask.unsqueeze(1)  # [B, 1, T]
+
+      # take mean
+      kl_scores= (kl_tokenwise * mask).sum(-1) / (mask.sum(-1) + 1e-8)  # [B, num_segments]
+      TEMP = 1  # higher = less spiky
       segment_mask_bool = (segments == self.mask_index)  # [B, num_segments, T]
 
       # should be fine since we only have at most 1 index that is non-masked per segment
@@ -346,19 +353,21 @@ class MDLMSegmentation(MDLM):
           # do a forward here
           p_x0 = self.forward(
             x, self._sigma_from_alphat(alpha_t)).exp()
-          if num_segments != 0 and num_segments is not None:
+          if num_segments is not None and num_segments > 1:
               p_x0, m_t = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
 
         if m_t is None:
           m_t = 1
         # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
-        BETA = 0 # effects how much we choose to bias by
+        BETA = 1 # effects how much we choose to bias by
         q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
 
         # print("q_xs before mask", q_xs.shape)
         if type(m_t) == type(q_xs):
           pass
           # print("m_t shape", m_t.shape)
+        
+        # intial implementation doesn't normalize in first place so this is fine?
         q_xs[:, :, self.mask_index] = (1 - alpha_s) * (1 - BETA * m_t)
 
         _x = sample_categorical(q_xs)
