@@ -264,7 +264,7 @@ class MDLMSegmentation(MDLM):
           x.shape[0], 1, device=self.device)
         if self.sampler == 'ancestral_cache':
           p_x0_cache, x_next, m_t_cache = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache, m_t=m_t_cache, num_segments=10)
+            x=x, t=t, dt=dt, p_x0=p_x0_cache, m_t=m_t_cache, num_segments=5)
           
           # print(x_next.shape)
           if (not torch.allclose(x_next, x)
@@ -330,7 +330,7 @@ class MDLMSegmentation(MDLM):
       # take mean amongst tokens that are chosen to be unmasked
       remaining_mask = (((x == self.mask_index).unsqueeze(1)) & (segments == self.mask_index)).float()
       kl_scores = (kl_tokenwise * remaining_mask).sum(-1) / (remaining_mask.sum(-1) + 1e-8)
-      TEMP = 1  # higher = less spiky
+      TEMP = 0.5  # higher = less spiky
       
       # this determines the tokens that have been unmasked in each segment, we want to see their difference in distribution
       segment_mask_bool = (segments != self.mask_index)  # [B, num_segments, T]
@@ -353,10 +353,8 @@ class MDLMSegmentation(MDLM):
           _, alpha_s = self.noise(t - dt)
         assert alpha_t.ndim == 2
 
-      # we create segments here
-      # linearly interpolate p_segment between start and end as t increases (0..1)
-      
       # FORWARD PASS HERE
+        unmask_bias = None
         if p_x0 is None or m_t is None:
           print("Doing update", self.count)
           self.count += 1
@@ -364,25 +362,30 @@ class MDLMSegmentation(MDLM):
           p_x0 = self.forward(
             x, self._sigma_from_alphat(alpha_t)).exp()
           if num_segments is not None and num_segments > 1:
-              p_x0, mask_bias = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
+              
+              p_x0, unmask_bias = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
 
-        if mask_bias is None:
-          mask_bias = torch.ones(x.shape[0], x.shape[1], 1, device=x.device).float()  # [batch, seq_len, 1]
+        if unmask_bias is None:
+          unmask_bias = torch.ones(x.shape[0], x.shape[1], device=x.device).float()  # [batch, seq_len, 1]
         
-        # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
+        # I THINK doing this should be fine since original code doesn't seem to treat each 
+        # token position as valid prob distribution, 
         # could be wrong though
         
-        BETA = 0.2 # effects how much we choose to bias by
+        BETA = 0.9 # effects how much we choose to bias by
+
+        # print("bias shape", mask_bias.shape)
+        # print("alpha shape", (alpha_s - alpha_t).shape)
         q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]  # [batch, seq_len, vocab_size]
-        q_xs = q_xs * (1 + BETA * mask_bias)  # increase probability for high-impact regions
+        q_xs = q_xs * (1 + BETA * unmask_bias.unsqueeze(-1)) 
 
         # makes element wise multiply work
-        alpha_s_exp = alpha_s.expand(-1, q_xs.shape[1])  # [batch, seq_len]
-        val = (1 - alpha_s_exp) * (1 - BETA * mask_bias.squeeze(-1))  # [batch, seq_len]
+        alpha_s_exp = alpha_s.expand(-1, q_xs.shape[1])  # [B, T]
+        val = (1 - alpha_s_exp) * (1 - BETA * unmask_bias)  # [B, T]
         q_xs[:, :, self.mask_index] = val
         _x = sample_categorical(q_xs)
         copy_flag = (x != self.mask_index).to(x.dtype)
-        return p_x0, copy_flag * x + (1 - copy_flag) * _x, mask_bias
+        return p_x0, copy_flag * x + (1 - copy_flag) * _x, unmask_bias
     
 
 class D3PMAbsorb(trainer_base.AbsorbingState):
