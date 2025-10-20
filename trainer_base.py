@@ -601,6 +601,7 @@ class AbsorbingState(Diffusion):
     # for the special tokens added in dataloader.py.
     # But we use tokenizer.vocab_size so as to to be
     # consistent with the prior checkpoints.
+    self.count = 0
     vocab_size = tokenizer.vocab_size
     if (not hasattr(tokenizer, 'mask_token')
         or tokenizer.mask_token is None):
@@ -652,6 +653,8 @@ class AbsorbingState(Diffusion):
       _, alpha_s = self.noise(t - dt)
     assert alpha_t.ndim == 2
     if p_x0 is None:
+      self.count += 1
+      print("Doing forward pass in ancestral update", self.count)
       p_x0 = self.forward(
         x, self._sigma_from_alphat(alpha_t)).exp()
     

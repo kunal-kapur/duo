@@ -176,6 +176,7 @@ class MDLMSegmentation(MDLM):
     def __init__(self, config, tokenizer):
       super().__init__(config, tokenizer)
       self._validate_configuration()
+      self.count = 0
 
 
     def create_mask_segment_batch(self, xt, total_segments):
@@ -256,17 +257,21 @@ class MDLMSegmentation(MDLM):
 
       dt = (1 - eps) / num_steps
       p_x0_cache = None
+      m_t_cache = None
 
       for i in range(num_steps):
         t = timesteps[i] * torch.ones(
           x.shape[0], 1, device=self.device)
         if self.sampler == 'ancestral_cache':
-          p_x0_cache, x_next = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache, num_segments=10)
+          p_x0_cache, x_next, m_t_cache = self._ancestral_update(
+            x=x, t=t, dt=dt, p_x0=p_x0_cache, m_t=m_t_cache, num_segments=10)
+          
+          # print(x_next.shape)
           if (not torch.allclose(x_next, x)
               or self.time_conditioning):
             # Disable caching
             p_x0_cache = None
+            m_t_cache = None
           x = x_next
         else:
           raise ValueError("Should have ancestral cache")
@@ -277,7 +282,7 @@ class MDLMSegmentation(MDLM):
         if self.sampler == 'analytic':
           x = self._denoiser_update(x=x, t=t0)
         else:
-          _, x = self._ancestral_update(x=x, t=t0, dt=None,
+          _, x, _ = self._ancestral_update(x=x, t=t0, dt=None,
                                   p_x0=p_x0_cache,
                                   noise_removal_step=True, num_segments=None)
       elif self.config.sampling.noise_removal == 'greedy':
@@ -324,7 +329,7 @@ class MDLMSegmentation(MDLM):
 
       # take mean
       kl_scores= (kl_tokenwise * mask).sum(-1) / (mask.sum(-1) + 1e-8)  # [B, num_segments]
-      TEMP = 1  # higher = less spiky
+      TEMP = 3  # higher = less spiky
       segment_mask_bool = (segments == self.mask_index)  # [B, num_segments, T]
 
       # should be fine since we only have at most 1 index that is non-masked per segment
@@ -336,8 +341,8 @@ class MDLMSegmentation(MDLM):
       return p_x0, token_weights.squeeze(-1)
 
 
-    def _ancestral_update(self, x, t, dt, p_x0=None,
-                    noise_removal_step=False, num_segments=None, m_t=None):
+    def _ancestral_update(self, x, t, dt, p_x0=None, m_t=None,
+                    noise_removal_step=False, num_segments=None):
         _, alpha_t = self.noise(t)
         if noise_removal_step:
           alpha_s = torch.ones_like(alpha_t)
@@ -350,6 +355,8 @@ class MDLMSegmentation(MDLM):
       
       # FORWARD PASS HERE
         if p_x0 is None or m_t is None:
+          print("Doing update", self.count)
+          self.count += 1
           # do a forward here
           p_x0 = self.forward(
             x, self._sigma_from_alphat(alpha_t)).exp()
@@ -359,7 +366,7 @@ class MDLMSegmentation(MDLM):
         if m_t is None:
           m_t = 1
         # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
-        BETA = 1 # effects how much we choose to bias by
+        BETA = 0.0 # effects how much we choose to bias by
         q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
 
         # print("q_xs before mask", q_xs.shape)
@@ -372,7 +379,7 @@ class MDLMSegmentation(MDLM):
 
         _x = sample_categorical(q_xs)
         copy_flag = (x != self.mask_index).to(x.dtype)
-        return p_x0, copy_flag * x + (1 - copy_flag) * _x
+        return p_x0, copy_flag * x + (1 - copy_flag) * _x, m_t
     
 
 class D3PMAbsorb(trainer_base.AbsorbingState):
