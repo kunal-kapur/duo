@@ -189,7 +189,7 @@ class MDLMSegmentation(MDLM):
 
         Returns:
             batch_seg_masked (torch.LongTensor): [B, total_segments, T]
-                Each segment has masked tokens inside that segment.
+                Each segment has un-masked tokens inside that segment.
             segment_boundaries (torch.LongTensor): [total_segments, 2]
                 Start and end indices (end exclusive) for each segment.
         """
@@ -199,7 +199,7 @@ class MDLMSegmentation(MDLM):
         if total_segments > T:
             raise ValueError(f"total_segments ({total_segments}) cannot exceed sequence length ({T}).")
 
-        # Randomly choose k-1 cut points in range [1, T-1)
+        # Randomly chooses k-1 cut points in range [1, T-1)
         cut_points = torch.randperm(T - 1, device=device)[:total_segments - 1]
         cut_points, _ = torch.sort(cut_points)
 
@@ -208,13 +208,15 @@ class MDLMSegmentation(MDLM):
         ends = torch.cat([cut_points, torch.tensor([T], device=device)])
 
         segment_range = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
+
+        # for each created segment identify what lies in range to mark as part of segment
         seg_masks = (segment_range >= starts.unsqueeze(1)) & (segment_range < ends.unsqueeze(1))  # [num_segments, T]
 
         xt_expanded = xt.unsqueeze(1).expand(B, total_segments, T)  # [B, num_segments, T]
 
-        # Replace positions inside each segment with mask_index
+        # Replace positions inside each segment with unmasked index and masks everywhere else
         batch_seg_masked = torch.where(
-            seg_masks.unsqueeze(0), 
+            ~seg_masks.unsqueeze(0), 
             torch.full_like(xt_expanded, self.mask_index),
             xt_expanded
         )
@@ -253,8 +255,6 @@ class MDLMSegmentation(MDLM):
         1, eps, num_steps + 1, device=self.device)
       
       # TODO make parameter in config to adjust the segment probability thresholds
-      
-
       dt = (1 - eps) / num_steps
       p_x0_cache = None
       m_t_cache = None
@@ -300,11 +300,11 @@ class MDLMSegmentation(MDLM):
       _x_all = sample_categorical(q_xs)
       segments, segment_boundaries = self.create_mask_segment_batch(_x_all, num_segments)
 
-      copy_index = (x != self.mask_index).to(x.dtype) # we maintain the ones that are unmasked
+       # we maintain the ones that are unmasked in x for next prediction
+      copy_index = (x != self.mask_index).to(x.dtype)
       segments = copy_index[:, None, :] * x[:, None, :] + (1 - copy_index[:, None, :]) * segments
       B, num_segments, T = segments.shape
 
-      kl_scores_list = []
       mask = (x == self.mask_index).float()  # [B, T]
       sigma = self._sigma_from_alphat(alpha_t)
 
@@ -327,10 +327,13 @@ class MDLMSegmentation(MDLM):
 
       mask = mask.unsqueeze(1)  # [B, 1, T]
 
-      # take mean
-      kl_scores= (kl_tokenwise * mask).sum(-1) / (mask.sum(-1) + 1e-8)  # [B, num_segments]
-      TEMP = 3  # higher = less spiky
-      segment_mask_bool = (segments == self.mask_index)  # [B, num_segments, T]
+      # take mean amongst tokens that are chosen to be unmasked
+      remaining_mask = (((x == self.mask_index).unsqueeze(1)) & (segments == self.mask_index)).float()
+      kl_scores = (kl_tokenwise * remaining_mask).sum(-1) / (remaining_mask.sum(-1) + 1e-8)
+      TEMP = 1  # higher = less spiky
+      
+      # this determines the tokens that have been unmasked in each segment, we want to see their difference in distribution
+      segment_mask_bool = (segments != self.mask_index)  # [B, num_segments, T]
 
       # should be fine since we only have at most 1 index that is non-masked per segment
       token_weights = (kl_scores.unsqueeze(-1) * segment_mask_bool.to(kl_scores.dtype)).sum(dim=1)  # [B, T]
@@ -361,25 +364,25 @@ class MDLMSegmentation(MDLM):
           p_x0 = self.forward(
             x, self._sigma_from_alphat(alpha_t)).exp()
           if num_segments is not None and num_segments > 1:
-              p_x0, m_t = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
+              p_x0, mask_bias = self.modify_distribution_with_segments(x, p_x0, alpha_t, alpha_s, num_segments)
 
-        if m_t is None:
-          m_t = 1
-        # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
-        BETA = 0.0 # effects how much we choose to bias by
-        q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-
-        # print("q_xs before mask", q_xs.shape)
-        if type(m_t) == type(q_xs):
-          pass
-          # print("m_t shape", m_t.shape)
+        if mask_bias is None:
+          mask_bias = torch.ones(x.shape[0], x.shape[1], 1, device=x.device).float()  # [batch, seq_len, 1]
         
-        # intial implementation doesn't normalize in first place so this is fine?
-        q_xs[:, :, self.mask_index] = (1 - alpha_s) * (1 - BETA * m_t)
+        # I think doing this should be fine since original code doesn't seem to treat each token position as valid prob distribution
+        # could be wrong though
+        
+        BETA = 0.2 # effects how much we choose to bias by
+        q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]  # [batch, seq_len, vocab_size]
+        q_xs = q_xs * (1 + BETA * mask_bias)  # increase probability for high-impact regions
 
+        # makes element wise multiply work
+        alpha_s_exp = alpha_s.expand(-1, q_xs.shape[1])  # [batch, seq_len]
+        val = (1 - alpha_s_exp) * (1 - BETA * mask_bias.squeeze(-1))  # [batch, seq_len]
+        q_xs[:, :, self.mask_index] = val
         _x = sample_categorical(q_xs)
         copy_flag = (x != self.mask_index).to(x.dtype)
-        return p_x0, copy_flag * x + (1 - copy_flag) * _x, m_t
+        return p_x0, copy_flag * x + (1 - copy_flag) * _x, mask_bias
     
 
 class D3PMAbsorb(trainer_base.AbsorbingState):
