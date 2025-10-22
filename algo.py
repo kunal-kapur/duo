@@ -207,7 +207,7 @@ class MDLMLOO(MDLM):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
-    self.segment_indices = self.get_segment_indices(num_segments=8)
+    self.segment_indices = self.get_segment_indices(num_segments=10)
     self.count = 0
 
   def get_segment_indices(self, num_segments: int) -> torch.Tensor:
@@ -248,7 +248,7 @@ class MDLMLOO(MDLM):
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ancestral_cache':
         p_x0_cache, x_next = self._ancestral_update(
-          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=2)
+          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=8)
         
         # print(x_next.shape)
         if (not torch.allclose(x_next, x)
@@ -355,10 +355,11 @@ class MDLMLOO(MDLM):
 
     # FORWARD PASS HERE
     if p_x0 is None:
+      print("Forward pass count:", self.count)
       self.count += 1
       if num_loo_segments is not None and num_loo_segments > 0:
         p_x0, log_probs_x0 = self.get_biased_dist(x, num_loo_segments, alpha_t)
-        print("MSE", torch.nn.functional.mse_loss(log_probs_x0.exp(), p_x0))
+        # print("MSE", torch.nn.functional.mse_loss(log_probs_x0.exp(), p_x0))
       else:
         p_x0 = self.forward(
           x, self._sigma_from_alphat(alpha_t)).exp()
