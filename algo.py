@@ -201,164 +201,175 @@ class D3PMAbsorb(trainer_base.AbsorbingState):
 
     diffusion_loss = self.T * L_vb_masked * (xt == self.mask_index)
     return self._reconstruction_loss(x0) + diffusion_loss
+
+class MDLMLOO(MDLM):
+
+  def __init__(self, config, tokenizer):
+    super().__init__(config, tokenizer)
+    self._validate_configuration()
+    self.segment_indices = self.get_segment_indices(num_segments=8)
+    self.count = 0
+
+  def get_segment_indices(self, num_segments: int) -> torch.Tensor:
+      """Divides the sequence into `num_segments` equal segments."""
+
+      total = self.num_tokens
+      base_len = total // num_segments
+      remainder = total % num_segments
+      segments = []
+      start = 0
+      for i in range(num_segments):
+          seg_len = base_len + (1 if i < remainder else 0)
+          end = start + seg_len
+          segments.append((start, end))
+          start = end
+
+      return torch.tensor(segments, dtype=torch.long)
   
-  class MDLMLOO(MDLM):
-    def __init__(self, config, tokenizer):
-      super().__init__(config, tokenizer)
-      self._validate_configuration()
-      self.segment_indices = self.get_segments_indices(num_segments=8)
-      self.count = 0
 
-    def get_segments_indices(self, num_segments: int) -> torch.Tensor:
-        """Divides the sequence into `num_segments` equal segments."""
-
-        total = self.num_tokens
-        base_len = total // num_segments
-        remainder = total % num_segments
-        segments = []
-        start = 0
-        for i in range(num_segments):
-            seg_len = base_len + (1 if i < remainder else 0)
-            end = start + seg_len
-            segments.append((start, end))
-            start = end
-
-        return torch.tensor(segments, dtype=torch.long)
+  @torch.no_grad()
+  def generate_samples(self, num_samples, num_steps=None,
+                      eps=1e-5):
+    """Generate samples from the model."""
+    # Lightning auto-casting is not working in this method for some reason
+    if num_steps is None:
+      num_steps = self.config.sampling.steps
+    x = self.prior_sample(num_samples, self.num_tokens)
+    timesteps = torch.linspace(
+      1, eps, num_steps + 1, device=self.device)
     
+    # TODO make parameter in config to adjust the segment probability thresholds
+    dt = (1 - eps) / num_steps
+    p_x0_cache = None
+    m_t_cache = None
 
-    @torch.no_grad()
-    def generate_samples(self, num_samples, num_steps=None,
-                        eps=1e-5):
-      """Generate samples from the model."""
-      # Lightning auto-casting is not working in this method for some reason
-      if num_steps is None:
-        num_steps = self.config.sampling.steps
-      x = self.prior_sample(num_samples, self.num_tokens)
-      timesteps = torch.linspace(
-        1, eps, num_steps + 1, device=self.device)
+    for i in range(num_steps):
+      t = timesteps[i] * torch.ones(
+        x.shape[0], 1, device=self.device)
+      if self.sampler == 'ancestral_cache':
+        p_x0_cache, x_next = self._ancestral_update(
+          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=2)
+        
+        # print(x_next.shape)
+        if (not torch.allclose(x_next, x)
+            or self.time_conditioning):
+          # Disable caching
+          p_x0_cache = None
+        x = x_next
+      else:
+        raise ValueError("Should have ancestral cache")
+    t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
+                                    device=self.device)
+    
+    if self.config.sampling.noise_removal == 'ancestral':
+      if self.sampler == 'analytic':
+        x = self._denoiser_update(x=x, t=t0)
+      else:
+        _, x = self._ancestral_update(x=x, t=t0, dt=None,
+                                p_x0=p_x0_cache,
+                                noise_removal_step=True)
+    elif self.config.sampling.noise_removal == 'greedy':
+      sigma = self._sigma_from_alphat(self.noise(t0)[1])
+      x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
+    return x
+  
+
+  def sample_segments(self, x: torch.Tensor, num_loo_segments: int) -> torch.Tensor:
+        """
+        Returns [B, num_loo_segments, num_tokens] tensor where masked tokens are replaced
+        with self.mask_index and unmasked positions keep the original x.
+        """
+        if num_loo_segments == 0 or num_loo_segments is None:
+          return None
+        B, num_tokens = x.shape
+        segments = self.segment_indices.to(x.device)
+        num_segments = len(segments)
+        
+        # Ensure num_loo_segments is not greater than available segments
+        num_loo_segments = min(num_loo_segments, num_segments)
+
+        # Choose random segments
+        chosen_indices = torch.randperm(num_segments, device=x.device)[:num_loo_segments]
+        chosen_segments = segments[chosen_indices]
+
+        # Shape: [B, num_loo_segments, num_tokens]
+        repeated_x = x.unsqueeze(1).repeat(1, num_loo_segments, 1)
+
+        # Shape: [1, num_tokens]
+        token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(0)
+
+        # Shape: [num_loo_segments, 1]
+        start_indices = chosen_segments[:, 0].unsqueeze(1)
+        end_indices = chosen_segments[:, 1].unsqueeze(1)
+
+
+        # Resulting broadcasts to: [num_loo_segments, num_tokens]
+        mask = (token_indices >= start_indices) & (token_indices < end_indices)
+
+        broadcastable_mask = mask.unsqueeze(0)
+
+        mask_value = torch.tensor(self.mask_index, device=x.device, dtype=x.dtype)
+
+        # torch.where broadcasts all inputs to the final shape [B, num_loo_segments, num_tokens]
+        # if it falls in place, set a mask
+        result = torch.where(broadcastable_mask, mask_value, repeated_x)
+
+        return result
+
+  
+  def get_biased_dist(self, x, num_loo_segments, alpha_t):
+      segments_masked = self.sample_segments(x, num_loo_segments)
       
-      # TODO make parameter in config to adjust the segment probability thresholds
-      dt = (1 - eps) / num_steps
-      p_x0_cache = None
-      m_t_cache = None
-
-      for i in range(num_steps):
-        t = timesteps[i] * torch.ones(
-          x.shape[0], 1, device=self.device)
-        if self.sampler == 'ancestral_cache':
-          p_x0_cache, x_next = self._ancestral_update(
-            x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=2)
-          
-          # print(x_next.shape)
-          if (not torch.allclose(x_next, x)
-              or self.time_conditioning):
-            # Disable caching
-            p_x0_cache = None
-          x = x_next
-        else:
-          raise ValueError("Should have ancestral cache")
-      t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
-                                      device=self.device)
+      # x shape: [B, num_tokens]
+      x_expanded = x.unsqueeze(1)
       
-      if self.config.sampling.noise_removal == 'ancestral':
-        if self.sampler == 'analytic':
-          x = self._denoiser_update(x=x, t=t0)
-        else:
-          _, x = self._ancestral_update(x=x, t=t0, dt=None,
-                                  p_x0=p_x0_cache,
-                                  noise_removal_step=True)
-      elif self.config.sampling.noise_removal == 'greedy':
-        sigma = self._sigma_from_alphat(self.noise(t0)[1])
-        x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
-      return x
-    
+      combined_input = torch.cat((x_expanded, segments_masked), dim=1)
+      
+      # need to reshape for a single batch forward pass
+      # model_input shape: [B * (1 + num_loo_segments), num_tokens]
+      B, num_total_segments, num_tokens = combined_input.shape
+      model_input = combined_input.view(B * num_total_segments, num_tokens)
+      
+      # WE DON"T EXP TO PRESERVE LOGITS FOR NOW
+      modified_sigma = alpha_t.repeat_interleave(num_total_segments, dim=0)
+      p_x0_all = self.forward(
+        model_input, self._sigma_from_alphat(modified_sigma))
+      reshaped = p_x0_all.view(B, num_total_segments, num_tokens, self.vocab_size)
+      log_probs_x0 = reshaped[:, 0]  # first segment's probabilities
+      log_probs_x0_loo = reshaped[:, 1:]  # LOO segments' probabilities
+      WEIGHT = 1
+      log_ratio = ((WEIGHT + 1) * log_probs_x0.unsqueeze(1)) - (WEIGHT * log_probs_x0_loo)
+      final_unnormalized_log_probs = log_ratio.mean(dim=1)
+      new_p_x0 = torch.softmax(final_unnormalized_log_probs, dim=-1) # Shape: [B, N, V]
+      return new_p_x0, log_probs_x0
 
-    def sample_segments(self, x: torch.Tensor, num_loo_segments: int) -> torch.Tensor:
-          """
-          Returns [B, num_loo_segments, num_tokens] tensor where masked tokens are replaced
-          with self.mask_index and unmasked positions keep the original x.
-          """
-          B, num_tokens = x.shape
-          segments = self.segments_indices(self.num_segments) 
-          num_segments = len(segments)
-          
-          # Ensure num_loo_segments is not greater than available segments
-          num_loo_segments = min(num_loo_segments, num_segments)
-
-          # Choose random segments
-          chosen_indices = torch.randperm(num_segments, device=x.device)[:num_loo_segments]
-          chosen_segments = segments[chosen_indices]
-
-          # Shape: [B, num_loo_segments, num_tokens]
-          repeated_x = x.unsqueeze(1).repeat(1, num_loo_segments, 1)
-
-
-          # Shape: [1, num_tokens]
-          token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(0)
-
-          # Shape: [num_loo_segments, 1]
-          start_indices = chosen_segments[:, 0].unsqueeze(1)
-          end_indices = chosen_segments[:, 1].unsqueeze(1)
-
-
-          # Resulting broadcasts to: [num_loo_segments, num_tokens]
-          mask = (token_indices >= start_indices) & (token_indices < end_indices)
-
-          broadcastable_mask = mask.unsqueeze(0)
-
-          mask_value = torch.tensor(self.mask_index, device=x.device, dtype=x.dtype)
-
-          # torch.where broadcasts all inputs to the final shape [B, num_loo_segments, num_tokens]
-          # if it falls in place, set a mask
-          result = torch.where(broadcastable_mask, mask_value, repeated_x)
-
-          return result
-    
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                           noise_removal_step=False, num_loo_segments=None):
-          _, alpha_t = self.noise(t)
-          if noise_removal_step:
-            alpha_s = torch.ones_like(alpha_t)
-          else:
-            _, alpha_s = self.noise(t - dt)
-          assert alpha_t.ndim == 2
+    _, alpha_t = self.noise(t)
+    if noise_removal_step:
+      alpha_s = torch.ones_like(alpha_t)
+    else:
+      _, alpha_s = self.noise(t - dt)
+    assert alpha_t.ndim == 2
 
-        # FORWARD PASS HERE
-          unmask_bias = None
-          if p_x0 is None:
-            self.count += 1
-            # do a forward here
-            
-            segments_masked = self.sample_segments(x, num_loo_segments)
-            
-            # x shape: [B, num_tokens]
-            x_expanded = x.unsqueeze(1)
-            
-            combined_input = torch.cat((x_expanded, segments_masked), dim=1)
-            
-            # need to reshape for a single batch forward pass
-            # model_input shape: [B * (1 + num_loo_segments), num_tokens]
-            B, num_total_segments, num_tokens = combined_input.shape
-            model_input = combined_input.view(B * num_total_segments, num_tokens)
-            
-            # WE DON"T EXP TO PRESERVE LOGITS FOR NOW
-            p_x0_all = self.forward(
-              model_input, self._sigma_from_alphat(alpha_t))
-            reshaped = p_x0_all.view(B, num_total_segments, num_tokens)
-            log_probs_x0 = reshaped[:, 0]  # first segment's probabilities
-            log_probs_x0_loo = reshaped[:, 1:]  # LOO segments' probabilities
-            WEIGHT = 1
-            log_ratio = ((WEIGHT + 1) * log_probs_x0.unsqueeze(1)) - (WEIGHT * log_probs_x0_loo)
-            final_unnormalized_log_probs = log_ratio.mean(dim=1)
-            p_x0 = torch.softmax(final_unnormalized_log_probs, dim=-1) # Shape: [B, N, V]
+    # FORWARD PASS HERE
+    if p_x0 is None:
+      self.count += 1
+      if num_loo_segments is not None and num_loo_segments > 0:
+        p_x0, log_probs_x0 = self.get_biased_dist(x, num_loo_segments, alpha_t)
+        print("MSE", torch.nn.functional.mse_loss(log_probs_x0.exp(), p_x0))
+      else:
+        p_x0 = self.forward(
+          x, self._sigma_from_alphat(alpha_t)).exp()
+      # do a forward here
 
-          q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-          q_xs[:, :, self.mask_index] = 1 - alpha_s
-          _x = sample_categorical(q_xs)
-          
-          copy_flag = (x != self.mask_index).to(x.dtype)
-          return p_x0, copy_flag * x + (1 - copy_flag) * _x
+    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+    q_xs[:, :, self.mask_index] = 1 - alpha_s
+    _x = sample_categorical(q_xs)
+    
+    copy_flag = (x != self.mask_index).to(x.dtype)
+    return p_x0, copy_flag * x + (1 - copy_flag) * _x
 
 class SEDDAbsorb(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
