@@ -207,7 +207,10 @@ class MDLMLOO(MDLM):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
-    self.segment_indices = self.get_segment_indices(num_segments=10)
+    self.num_segments = config.algo.num_segments
+    self.guidance_factor = config.algo.guidance_factor
+    self.num_loo = config.algo.num_loo
+    self.segment_indices = self.get_segment_indices(num_segments=self.num_segments)
     self.count = 0
 
   def get_segment_indices(self, num_segments: int) -> torch.Tensor:
@@ -248,7 +251,7 @@ class MDLMLOO(MDLM):
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ancestral_cache':
         p_x0_cache, x_next = self._ancestral_update(
-          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=8)
+          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=self.num_loo)
         
         # print(x_next.shape)
         if (not torch.allclose(x_next, x)
@@ -337,7 +340,7 @@ class MDLMLOO(MDLM):
       reshaped = p_x0_all.view(B, num_total_segments, num_tokens, self.vocab_size)
       log_probs_x0 = reshaped[:, 0]  # first segment's probabilities
       log_probs_x0_loo = reshaped[:, 1:]  # LOO segments' probabilities
-      WEIGHT = 1
+      WEIGHT = self.guidance_factor
       log_ratio = ((WEIGHT + 1) * log_probs_x0.unsqueeze(1)) - (WEIGHT * log_probs_x0_loo)
       final_unnormalized_log_probs = log_ratio.mean(dim=1)
       new_p_x0 = torch.softmax(final_unnormalized_log_probs, dim=-1) # Shape: [B, N, V]
