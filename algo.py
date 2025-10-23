@@ -358,8 +358,8 @@ class MDLMLOO(MDLM):
 
     # FORWARD PASS HERE
     if p_x0 is None:
-      print("Forward pass count:", self.count)
-      self.count += 1
+      # print("Forward pass count:", self.count)
+      # self.count += 1
       if num_loo_segments is not None and num_loo_segments > 0:
         p_x0, log_probs_x0 = self.get_biased_dist(x, num_loo_segments, alpha_t)
         # print("MSE", torch.nn.functional.mse_loss(log_probs_x0.exp(), p_x0))

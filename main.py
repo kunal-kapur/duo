@@ -87,8 +87,13 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer):
   logger.info('Starting Sample Eval.')
-  model = _load_from_ch
-  e_ema:
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model,
+    config=config,
+    tokenizer=tokenizer)
+  model.metrics.gen_ppl.reset()
+  model.metrics.sample_entropy.reset()
+  if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
   stride_length = config.sampling.stride_length
