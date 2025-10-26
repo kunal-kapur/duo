@@ -512,6 +512,12 @@ def get_dataset(dataset_name,
       seq_len=32,
       vocab_size=256,
     )
+  elif dataset_name == 'toxicity':
+    dataset = datasets.load_dataset(
+      "allenai/real-toxicity-prompts",
+      cache_dir=cache_dir,
+      streaming=streaming,
+      revision=revision)
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -556,6 +562,9 @@ def get_dataset(dataset_name,
       text = example['sentence']
     elif 'scientific_papers' in dataset_name:
       text = example['article']
+
+    elif dataset_name == 'toxicity':
+      text = example['prompt']['text']
     else:
       text = example['text']
     
@@ -604,6 +613,9 @@ def get_dataset(dataset_name,
   elif dataset_name == 'ag_news':
     tokenized_dataset = tokenized_dataset.remove_columns(
       ['text', 'label'])
+  elif dataset_name == 'toxicity':
+    tokenized_dataset = tokenized_dataset.remove_columns(
+      ['filename', 'begin', 'end', 'challenging', 'prompt', 'continuation'])
   else:
     tokenized_dataset = tokenized_dataset.remove_columns(
       'text')
