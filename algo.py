@@ -232,7 +232,7 @@ class MDLMLOO(MDLM):
 
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                      eps=1e-5):
+                      eps=1e-5, starting_prompt_tokens=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
