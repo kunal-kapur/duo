@@ -8,6 +8,10 @@ import omegaconf
 import rich.syntax
 import rich.tree
 import torch
+from metrics import Toxicity
+
+from datasets import load_dataset
+
 
 import algo
 import dataloader
@@ -91,6 +95,8 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
+
+  # toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
   if config.eval.disable_ema:
@@ -124,8 +130,10 @@ def _generate_samples(diffusion_model, config, logger,
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
+    # toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
+    # print('Average Toxicity:', toxicity_eval.mean().item())
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
     json.dump({'generative_ppl': generative_ppl,

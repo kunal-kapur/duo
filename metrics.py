@@ -6,8 +6,34 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 import transformers
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 LOG2 = math.log(2)
+
+class Toxicity:
+    def __init__(self, model_path='/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw'):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_path).to('cuda')
+        self.LEN = 512
+        self.model.eval()
+
+    def compute_toxicity(self, text_chunks):
+        # text_chunks: List of text segments, each <= self.LEN tokens (all same length)
+        # Tokenize all at once
+        encoded = self.tokenizer(
+            text_chunks,
+            return_tensors='pt',
+            padding=False,  # Already same length, so no need to pad
+            truncation=True,
+            max_length=self.LEN  # Defensive: does nothing if inputs are already <= LEN
+        )
+        batch_inputs = {k: v.to('cuda') for k, v in encoded.items()}
+        with torch.no_grad():
+            outputs = self.model(**batch_inputs)
+        logits = outputs.logits
+        probs = F.softmax(logits, dim=1)[:, 1]
+        return probs
+
 
 
 class NLL(torchmetrics.aggregation.MeanMetric):
@@ -208,3 +234,5 @@ class Metrics:
         token_mask = sample_chunk != self.tokenizer.eos_token_id
         valid_tokens = first_eos[..., 1:] + token_mask[..., 1:]
         self.gen_ppl.update(nlls * valid_tokens, valid_tokens)
+
+  
