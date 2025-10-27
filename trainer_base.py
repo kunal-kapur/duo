@@ -352,14 +352,14 @@ class TrainerBase(L.LightningModule):
   def generate_samples(self, num_samples, num_steps, eps):
     raise NotImplementedError
 
-  def restore_model_and_sample(self, num_steps, eps=1e-5):
+  def restore_model_and_sample(self, num_steps, eps=1e-5, prepended_text=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
     samples = self.generate_samples(
       num_samples=self.config.loader.eval_batch_size,
       num_steps=num_steps,
-      eps=eps)
+      eps=eps, prepended_text=prepended_text)
     self._train_mode()
     return samples
 
@@ -495,12 +495,19 @@ class Diffusion(TrainerBase):
 
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                       eps=1e-5):
+                       eps=1e-5, prepended_text=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    if prepended_text is not None:
+        pad_id = self.tokenizer.pad_token_id
+        # Mask for non-pad elements in the prepended text
+        print("PREPEND TEXT", prepended_text)
+        prefix_mask = (prepended_text != pad_id).to(x.dtype)
+        x = x * (1 - prefix_mask) + prepended_text * prefix_mask
+
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
