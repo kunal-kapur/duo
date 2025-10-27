@@ -89,14 +89,21 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 
 def _generate_samples(diffusion_model, config, logger,
-                      tokenizer):
+                      tokenizer, toxic_eval=False):
   logger.info('Starting Sample Eval.')
   model = _load_from_checkpoint(
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
 
-  # toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
+  
+  if toxic_eval is True:
+    toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
+    assert config.data.valid == 'toxicity'
+    _, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer, skip_train=True, valid_seed=config.seed)
+
+
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
   if config.eval.disable_ema:
@@ -118,8 +125,13 @@ def _generate_samples(diffusion_model, config, logger,
       # and diffusion.compute_generative_perplexity() discards
       # any text after the first EOS token.
     else:
+      prepended_text = None
+      if toxic_eval:
+        # For toxicity eval, we prepend the prompt to the generated samples
+        batch = next(iter(valid_ds))
+        prepended_text = batch['input_ids'].to(model.device)
       samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps)
+        num_steps=config.sampling.steps, prepended_text=prepended_text)
       model.metrics.record_entropy(samples)
       text_samples = model.tokenizer.batch_decode(samples)
       model.metrics.record_generative_perplexity(
@@ -254,6 +266,9 @@ def main(config):
     _generate_samples(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'toxic_eval':
+    _generate_samples(**kwargs, toxic_eval=True)
+
   else:
     _train(**kwargs)
 

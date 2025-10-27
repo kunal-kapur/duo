@@ -558,40 +558,68 @@ def get_dataset(dataset_name,
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
 
   def preprocess_and_tokenize(example):
+    # Choose the right text field depending on dataset
     if dataset_name == 'ptb':
       text = example['sentence']
     elif 'scientific_papers' in dataset_name:
       text = example['article']
-
     elif dataset_name == 'toxicity':
-      text = example['prompt']['text']
+      # Extract prompts
+      text = [i['text'] for i in example['prompt']]
     else:
       text = example['text']
-    
+
+    # Apply detokenizer if needed
     if detokenizer is not None:
       text = _apply_detokenizer(detokenizer)(text)
 
     tokenizer.padding_side = 'right'
     tokenizer.truncation_side = 'right'
 
-    if wrap:
-      tokens = tokenizer(text,
-                         add_special_tokens=False,
-                         return_attention_mask=False,
-                         return_token_type_ids=False)
-      if insert_eos:
-        tokens = {'input_ids':
-                  [t + [EOS] for t in tokens['input_ids']]}
-      # Still missing BOS, but will be added in group_texts
-    else:
-      tokens = tokenizer(text,
-                         max_length=block_size,
-                         padding='max_length',
-                         truncation=True,
-                         add_special_tokens=True,
-                         return_attention_mask=True,
-                         return_token_type_ids=True)
+    # ----- Normal wrapping logic for all datasets -----
+    if dataset_name != 'toxicity':
+      if wrap:
+        tokens = tokenizer(
+          text,
+          add_special_tokens=False,
+          return_attention_mask=False,
+          return_token_type_ids=False
+        )
+        if insert_eos:
+          tokens = {'input_ids': [t + [EOS] for t in tokens['input_ids']]}
+      else:
+        tokens = tokenizer(
+          text,
+          max_length=block_size,
+          padding='max_length',
+          truncation=True,
+          add_special_tokens=True,
+          return_attention_mask=True,
+          return_token_type_ids=True
+        )
+      return tokens
+
+    # ----- Special case for toxicity dataset -----
+    # We want extra padding added *after* each prompt for future fill-ins
+    tokens = tokenizer(
+      text,
+      add_special_tokens=False,
+      return_attention_mask=False,
+      return_token_type_ids=False
+    )
+
+    # Add token-level padding region after each prompt
+    extra_pad_length = 64  # customize this length
+    pad_id = tokenizer.pad_token_id
+    for i in range(len(tokens['input_ids'])):
+      tokens['input_ids'][i] += [pad_id] * extra_pad_length
+
+    # Optionally add EOS token
+    if insert_eos:
+      tokens['input_ids'] = [t + [EOS] for t in tokens['input_ids']]
+
     return tokens
+
 
   if streaming:
     tokenized_dataset = data.map(
@@ -717,6 +745,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
+  elif config.data.valid in ['toxicity']: # doesn't have splits
+    validation_split = 'train'
   else:
     validation_split = 'validation'
   if skip_valid:

@@ -1,0 +1,9 @@
+# TODO: When using this dataset, set model.length = 256 to match D3PM setup
+train: toxicity
+valid: toxicity
+tokenizer_name_or_path: gpt2
+cache_dir: /home/ubuntu/kkapur-v2/data
+wrap: True
+streaming: False
+insert_train_eos: True
+insert_valid_eos: True

@@ -232,12 +232,17 @@ class MDLMLOO(MDLM):
 
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                      eps=1e-5, starting_prompt_tokens=None):
+                      eps=1e-5, prepended_text=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    if prepended_text is not None:
+        pad_id = self.tokenizer.pad_token_id
+        # Mask for non-pad elements in the prepended text
+        prefix_mask = (prepended_text != pad_id).to(x.dtype)
+        x = x * (1 - prefix_mask) + prepended_text * prefix_mask
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     
