@@ -95,6 +95,23 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
+  
+  
+  hyperparameters = {
+    "steps": config.sampling.steps,
+  }
+  if config.algo.name == 'mdlm_loo':
+    hyperparameters['num_loo'] = config.model.num_loo
+    hyperparameters['num_segments'] = config.model.num_segments
+    hyperparameters['guidance_factor'] = config.model.guidance_factor
+
+  wandb_logger = None
+  if config.get('wandb', None) is not None:
+    wandb_logger = L.pytorch.loggers.WandbLogger(
+      config=omegaconf.OmegaConf.to_object(config),
+      ** config.wandb)
+  # 
+    wandb_logger.log_hyperparams(hyperparameters)
 
   # toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
   model.metrics.gen_ppl.reset()
@@ -133,6 +150,12 @@ def _generate_samples(diffusion_model, config, logger,
     # toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
+    metrics = {
+      'generative_ppl': generative_ppl,
+      'entropy': entropy
+    }
+    if wandb_logger is not None:
+      wandb_logger.log_metrics(metrics)
     # print('Average Toxicity:', toxicity_eval.mean().item())
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:

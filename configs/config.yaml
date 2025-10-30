@@ -76,17 +76,18 @@ trainer:
   val_check_interval: 5000
 
 wandb:
-  project: flow-ode
-  notes: Flow ODEs for UDLM
+  project: MDLM_LOO
+  notes: testing leave one out
   group: null
   job_type: null
-  name: null
-  id: ${.name}_${seed}
+  name: ${algo.name}_${data.train}_${noise.type}_${seed}_${now:%Y%m%d_%H%M%S}
+  id: ${algo.name}_${data.train}_${noise.type}_${seed}_${now:%Y%m%d_%H%M%S}
   tags:
     - ${noise.type}
     - ${data.train}
     - ${data.valid}
     - ${algo.name}
+
 
 hydra:
   run:
