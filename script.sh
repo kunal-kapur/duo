@@ -1,8 +1,8 @@
 python main.py \
-  mode=sample_eval \
+  mode=toxic_eval \
   loader.batch_size=2 \
   loader.eval_batch_size=8 \
-  data=openwebtext-split \
+  data=toxicity \
   algo=mdlm \
   eval.checkpoint_path=/home/ubuntu/kkapur-v2/models/mdlm.ckpt  \
   sampling.steps=10 \

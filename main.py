@@ -88,6 +88,8 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('ids:', last)
 
 
+
+# TODO Fix, this config is a mess
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer, toxic_eval=False):
   logger.info('Starting Sample Eval.')
@@ -159,13 +161,16 @@ def _generate_samples(diffusion_model, config, logger,
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
-    # toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
-    print('Generative perplexity:', generative_ppl)
-    print('Sample entropy:', entropy)
     metrics = {
       'generative_ppl': generative_ppl,
       'entropy': entropy
     }
+    if toxic_eval:
+      toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
+      metrics['average_toxicity'] = toxicity_eval.mean().item()
+      print('Average Toxicity:', metrics['average_toxicity'])
+    print('Generative perplexity:', generative_ppl)
+    print('Sample entropy:', entropy)
     if wandb_logger is not None:
       wandb_logger.log_metrics(metrics)
     # print('Average Toxicity:', toxicity_eval.mean().item())
