@@ -4,6 +4,9 @@ parameterization: subs
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
+num_segments: 8
+num_loo: 3
+guidance_factor: 1.0
 causal_attention: False
 ignore_bos: False
 loss_type: elbo

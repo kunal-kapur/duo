@@ -96,22 +96,6 @@ def _generate_samples(diffusion_model, config, logger,
     config=config,
     tokenizer=tokenizer)
   
-  
-  hyperparameters = {
-    "steps": config.sampling.steps,
-  }
-  if config.algo.name == 'mdlm_loo':
-    hyperparameters['num_loo'] = config.model.num_loo
-    hyperparameters['num_segments'] = config.model.num_segments
-    hyperparameters['guidance_factor'] = config.model.guidance_factor
-
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
-  # 
-    wandb_logger.log_hyperparams(hyperparameters)
 
   # toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
   model.metrics.gen_ppl.reset()
@@ -154,8 +138,6 @@ def _generate_samples(diffusion_model, config, logger,
       'generative_ppl': generative_ppl,
       'entropy': entropy
     }
-    if wandb_logger is not None:
-      wandb_logger.log_metrics(metrics)
     # print('Average Toxicity:', toxicity_eval.mean().item())
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
@@ -163,6 +145,67 @@ def _generate_samples(diffusion_model, config, logger,
                'entropy': entropy,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
+  return metrics
+
+def _gen_eval(diffusion_model, config, logger, tokenizer):
+    temps_to_use = torch.linspace(.3, 1.0, steps=10).tolist()
+    steps_to_use = [8, 16, 32]
+
+    model = _load_from_checkpoint(
+        diffusion_model=diffusion_model, config=config, tokenizer=tokenizer
+    )
+    hyperparameters = {
+      "steps": config.sampling.steps,
+    }
+    if config.algo.name == 'mdlm_loo':
+      hyperparameters['num_loo'] = config.algo.num_loo
+      hyperparameters['num_segments'] = config.algo.num_segments
+      hyperparameters['guidance_factor'] = config.algo.guidance_factor
+
+    wandb_logger = None
+    if config.get('wandb', None) is not None:
+      wandb_logger = L.pytorch.loggers.WandbLogger(
+        config=omegaconf.OmegaConf.to_object(config),
+        ** config.wandb)
+    # 
+      wandb_logger.log_hyperparams(hyperparameters)
+
+
+    model.backbone = torch.compile(model.backbone)
+    total_metadata = {}
+    for steps in steps_to_use:
+        cur_step_info = {}
+        config.sampling.steps = steps
+
+        for temp in temps_to_use:
+            config.sampling.temperature = temp
+
+            model.temp = temp
+            model.metrics.reset()
+            res = _generate_samples(diffusion_model, config, logger, tokenizer,)
+            res['steps'] = steps
+            res['temperature'] = temp
+            cur_step_info[temp] = {
+                "perplexity": res["generative_ppl"],
+                "entropy": res["entropy"],
+            }
+        total_metadata[steps] = cur_step_info
+
+    if wandb_logger is not None:
+        flat_metrics = {
+            f"ppl/steps_{steps}/temp_{temp}": vals["perplexity"]
+            for steps, temps in total_metadata.items()
+            for temp, vals in temps.items()
+        }
+        flat_metrics.update({
+            f"entropy/steps_{steps}/temp_{temp}": vals["entropy"]
+            for steps, temps in total_metadata.items()
+            for temp, vals in temps.items()
+        })
+        wandb_logger.log_metrics(flat_metrics)
+
+    return
+
 
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
@@ -275,6 +318,9 @@ def main(config):
             'logger': logger}
   if config.mode == 'sample_eval':
     _generate_samples(**kwargs)
+  if config.mode == 'gen_eval':
+    _gen_eval(**kwargs)
+
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
   else:

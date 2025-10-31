@@ -170,7 +170,7 @@ def _generate_synthetic_data(dataset_size,
   # tokens representing sequence boundary
   dataset[:, 0] = vocab_size - 2  # bos
   dataset[:, -1] = vocab_size - 1  # eos
-
+ 
   for i in range(dataset_size):
     # sample from 0, 1, ..., vocab_size - 3
     temp = np.random.randint(vocab_size - 2)

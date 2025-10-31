@@ -33,6 +33,7 @@ sampling:
   semi_ar: False
   stride_length: 1
   num_strides: 1
+  temperature: 1.0
 
 training:
   ema: 0.9999
