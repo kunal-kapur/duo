@@ -89,12 +89,14 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 
 def _generate_samples(diffusion_model, config, logger,
-                      tokenizer):
+                      tokenizer, model=None):
   logger.info('Starting Sample Eval.')
-  model = _load_from_checkpoint(
-    diffusion_model=diffusion_model,
-    config=config,
-    tokenizer=tokenizer)
+
+  if model is None:
+    model = _load_from_checkpoint(
+      diffusion_model=diffusion_model,
+      config=config,
+      tokenizer=tokenizer)
   
 
   # toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
@@ -148,7 +150,7 @@ def _generate_samples(diffusion_model, config, logger,
   return metrics
 
 def _gen_eval(diffusion_model, config, logger, tokenizer):
-    temps_to_use = torch.linspace(.3, 1.0, steps=10).tolist()
+    temps_to_use = torch.linspace(.5, 1.0, steps=10).tolist()
     steps_to_use = [8, 16, 32]
 
     model = _load_from_checkpoint(
@@ -171,18 +173,17 @@ def _gen_eval(diffusion_model, config, logger, tokenizer):
       wandb_logger.log_hyperparams(hyperparameters)
 
 
-    model.backbone = torch.compile(model.backbone)
+    # model.backbone = torch.compile(model.backbone)
     total_metadata = {}
     for steps in steps_to_use:
         cur_step_info = {}
         config.sampling.steps = steps
-
         for temp in temps_to_use:
+            print("Itearting on ", temp)
             config.sampling.temperature = temp
-
-            model.temp = temp
+            model.temperature = temp
             model.metrics.reset()
-            res = _generate_samples(diffusion_model, config, logger, tokenizer,)
+            res = _generate_samples(diffusion_model, config, logger, tokenizer, model=model)
             res['steps'] = steps
             res['temperature'] = temp
             cur_step_info[temp] = {

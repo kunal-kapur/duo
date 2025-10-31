@@ -78,7 +78,7 @@ class MDLM(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
-    self.temp = config.algo.get("temp", 1.0)
+    self.temperature = config.sampling.get("temperature", 1.0)
 
   def _validate_configuration(self):
     # ancestral sampling isn't desirable because it's slow
@@ -86,7 +86,7 @@ class MDLM(trainer_base.AbsorbingState):
 
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
-    model_output = model_output / self.temp
+    model_output = model_output / self.temperature
     model_output[:, :, self.mask_index] += self.neg_infinity
     
     # Normalize the model_output such that x.exp() is
