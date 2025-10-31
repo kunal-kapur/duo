@@ -504,7 +504,6 @@ class Diffusion(TrainerBase):
     if prepended_text is not None:
         pad_id = self.tokenizer.pad_token_id
         # Mask for non-pad elements in the prepended text
-        print("PREPEND TEXT", prepended_text)
         prefix_mask = (prepended_text != pad_id).to(x.dtype)
         x = x * (1 - prefix_mask) + prepended_text * prefix_mask
 

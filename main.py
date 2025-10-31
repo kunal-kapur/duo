@@ -88,6 +88,8 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('ids:', last)
 
 
+
+# TODO Fix, this config is a mess
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer, toxic_eval=False):
   logger.info('Starting Sample Eval.')
@@ -95,6 +97,23 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
+  
+  
+  hyperparameters = {
+    "steps": config.sampling.steps,
+  }
+  if config.algo.name == 'mdlm_loo':
+    hyperparameters['num_loo'] = config.model.num_loo
+    hyperparameters['num_segments'] = config.model.num_segments
+    hyperparameters['guidance_factor'] = config.model.guidance_factor
+
+  wandb_logger = None
+  if config.get('wandb', None) is not None:
+    wandb_logger = L.pytorch.loggers.WandbLogger(
+      config=omegaconf.OmegaConf.to_object(config),
+      ** config.wandb)
+  # 
+    wandb_logger.log_hyperparams(hyperparameters)
 
   
   if toxic_eval is True:
@@ -142,9 +161,18 @@ def _generate_samples(diffusion_model, config, logger,
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
-    # toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
+    metrics = {
+      'generative_ppl': generative_ppl,
+      'entropy': entropy
+    }
+    if toxic_eval:
+      toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
+      metrics['average_toxicity'] = toxicity_eval.mean().item()
+      print('Average Toxicity:', metrics['average_toxicity'])
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
+    if wandb_logger is not None:
+      wandb_logger.log_metrics(metrics)
     # print('Average Toxicity:', toxicity_eval.mean().item())
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
