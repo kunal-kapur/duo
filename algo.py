@@ -211,9 +211,9 @@ class MDLMLOO(MDLM):
     self.guidance_factor = config.algo.guidance_factor
     self.num_loo = config.algo.num_loo
     self.segment_indices = self.get_segment_indices(num_segments=self.num_segments)
-    self.count = 0
 
-  
+    self.constraint_function = config.algo.get('constrain_function', None)
+
 
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
