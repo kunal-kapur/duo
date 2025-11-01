@@ -17,6 +17,32 @@ class Toxicity:
         self.LEN = 512
         self.model.eval()
 
+    def compute_toxicity_grad(self, text_chunks):
+        encoded = self.tokenizer(
+            text_chunks,
+            return_tensors='pt',
+            padding=False,
+            truncation=True,
+            max_length=self.LEN
+        )
+        input_ids = encoded['input_ids'].to('cuda')
+        attention_mask = encoded['attention_mask'].to('cuda')
+        input_ids = input_ids.clone().detach().requires_grad_(True)
+        
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits      # [batch, 2]
+        probs = F.softmax(logits, dim=1)[:, 0]  # Toxic = index 0
+
+        targets = torch.ones(logits.shape[0], dtype=torch.long, device=logits.device)  # non-toxic=1
+        loss = F.cross_entropy(logits, targets)
+        grad = torch.autograd.grad(loss, input_ids, retain_graph=True)[0]
+
+        return grad, probs
+
+
+    
+
+
     def compute_toxicity(self, text_chunks):
         # text_chunks: List of text segments, each <= self.LEN tokens (all same length)
         # Tokenize all at once

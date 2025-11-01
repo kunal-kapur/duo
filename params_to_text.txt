@@ -1,3 +1,9 @@
 num_segments---> [1, 2, 4, 8, 16]
 num_loo---> [0, 0.25, 0.5, 0.75]
 W=[0,1,1.5,2,2.5]
+
+
+# entropy perplexity analysis
+# reshaping batches to right size 
+# f(x | no mask) - f(x | mask) ---> calculate gradient?
+# shift distirbution of unmasked token

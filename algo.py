@@ -213,26 +213,11 @@ class MDLMLOO(MDLM):
     self.segment_indices = self.get_segment_indices(num_segments=self.num_segments)
     self.count = 0
 
-  def get_segment_indices(self, num_segments: int) -> torch.Tensor:
-      """Divides the sequence into `num_segments` equal segments."""
-
-      total = self.num_tokens
-      base_len = total // num_segments
-      remainder = total % num_segments
-      segments = []
-      start = 0
-      for i in range(num_segments):
-          seg_len = base_len + (1 if i < remainder else 0)
-          end = start + seg_len
-          segments.append((start, end))
-          start = end
-
-      return torch.tensor(segments, dtype=torch.long)
   
 
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                      eps=1e-5, prepended_text=None):
+                      eps=1e-5, prepended_text=None, guidance_enabled=True):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
@@ -325,35 +310,24 @@ class MDLMLOO(MDLM):
         return result
 
   
-  def get_biased_dist(self, x, num_loo_segments, alpha_t):
-      segments_masked = self.sample_segments(x, num_loo_segments)
-      
-      # x shape: [B, num_tokens]
-      x_expanded = x.unsqueeze(1)
-      
-      combined_input = torch.cat((x_expanded, segments_masked), dim=1)
-      
-      # need to reshape for a single batch forward pass
-      # model_input shape: [B * (1 + num_loo_segments), num_tokens]
-      B, num_total_segments, num_tokens = combined_input.shape
-      model_input = combined_input.view(B * num_total_segments, num_tokens)
-      
-      # WE DON"T EXP TO PRESERVE LOGITS FOR NOW
-      modified_sigma = alpha_t.repeat_interleave(num_total_segments, dim=0)
-      p_x0_all = self.forward(
-        model_input, self._sigma_from_alphat(modified_sigma))
-      reshaped = p_x0_all.view(B, num_total_segments, num_tokens, self.vocab_size)
-      log_probs_x0 = reshaped[:, 0]  # first segment's probabilities
-      log_probs_x0_loo = reshaped[:, 1:]  # LOO segments' probabilities
-      WEIGHT = self.guidance_factor
-      log_ratio = ((WEIGHT + 1) * log_probs_x0.unsqueeze(1)) - (WEIGHT * log_probs_x0_loo)
-      final_unnormalized_log_probs = log_ratio.mean(dim=1)
-      new_p_x0 = torch.softmax(final_unnormalized_log_probs, dim=-1) # Shape: [B, N, V]
-      return new_p_x0, log_probs_x0
+
+  def separate_outputs(self, model_output):
+    # Function that will separate by end of text token to
+    # ideally everything has same length so we can batch the process
+    # return indices that should remain masked
+    pass
+
+  def random_segmask(self, x, num_loo_segments):
+    # function that will calculate create a random segment mask
+    pass
+
+  def compute_avg_gradient_mask(self, x, num_loo_segments):
+    # function to compute average gradient on each segment provided
+    pass
 
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
-                          noise_removal_step=False, num_loo_segments=None):
+                          noise_removal_step=False, ):
     _, alpha_t = self.noise(t)
     if noise_removal_step:
       alpha_s = torch.ones_like(alpha_t)
@@ -365,13 +339,15 @@ class MDLMLOO(MDLM):
     if p_x0 is None:
       # print("Forward pass count:", self.count)
       # self.count += 1
-      if num_loo_segments is not None and num_loo_segments > 0:
-        p_x0, log_probs_x0 = self.get_biased_dist(x, num_loo_segments, alpha_t)
-        # print("MSE", torch.nn.functional.mse_loss(log_probs_x0.exp(), p_x0))
-      else:
-        p_x0 = self.forward(
-          x, self._sigma_from_alphat(alpha_t)).exp()
+      p_x0 = self.forward(
+        x, self._sigma_from_alphat(alpha_t)).exp()
+      
       # do a forward here
+      # run reshape p_x0
+      # separate_outputs()
+      # random_segmask()
+      # compute avg gradient mask 
+      # check if I want to px0 to be the gradient
 
     q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
     q_xs[:, :, self.mask_index] = 1 - alpha_s

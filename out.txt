@@ -1,0 +1,6 @@
+Mask token: <mask>
+Mask token id: 50264
+Mask positions in input: (tensor([0]), tensor([4]))
+Batch torch.Size([2, 7])
+output: SequenceClassifierOutput(loss=None, logits=tensor([[ 4.7074, -4.9392],
+        [-3.9680,  3.8369]], grad_fn=<AddmmBackward0>), hidden_states=None, attentions=None)
