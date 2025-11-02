@@ -243,10 +243,10 @@ class TrainerBase(L.LightningModule):
   def _process_model_output(self, model_output, xt, sigma):
     raise NotImplementedError
 
-  def forward(self, xt, sigma):
+  def forward(self, xt, sigma, bias=None):
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output = self.backbone(xt, sigma)
+      model_output = self.backbone(xt, sigma, bias=bias)
     return self._process_model_output(
       model_output=model_output, xt=xt, sigma=sigma)
 

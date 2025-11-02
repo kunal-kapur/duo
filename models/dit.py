@@ -385,8 +385,10 @@ class EmbeddingLayer(nn.Module):
     self.embedding = nn.Parameter(torch.empty((vocab_dim, dim)))
     torch.nn.init.kaiming_uniform_(self.embedding, a=math.sqrt(5))
 
-  def forward(self, x):
+  def forward(self, x, bias=None):
     if x.ndim == 2:
+      if bias is not None:
+        return self.embedding[x] - self.embedding[bias]
       return self.embedding[x]
     assert x.ndim == 3
     return torch.einsum(
@@ -467,8 +469,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, x, sigma):
-    x = self.vocab_embed(x)
+  def forward(self, x, sigma, bias=None):
+    x = self.vocab_embed(x, bias=bias)
     if self.causal:
       t_cond = None
     else:

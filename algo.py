@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import trainer_base
 import utils
 from trainer_base import sample_categorical
+from constraint import Constraint
 
 
 class AR(trainer_base.TrainerBase):
@@ -204,30 +205,36 @@ class D3PMAbsorb(trainer_base.AbsorbingState):
 
 class MDLMLOO(MDLM):
 
+
+  # ASSUME THAT WE CAN DO GENERATION WITH PREPEND TEXT AND CONTROL OUTPUT GENERATION
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
     self.num_segments = config.algo.num_segments
     self.guidance_factor = config.algo.guidance_factor
     self.num_loo = config.algo.num_loo
-    self.segment_indices = self.get_segment_indices(num_segments=self.num_segments)
+    self.constraint_function = Constraint(tokenizer, config)
+    self.graveyard = None
+    self.reshaped_prefix_batch = None
 
-    self.constraint_function = config.algo.get('constrain_function', None)
 
 
+  # VERY scuffed and lot of hard-coding. Reshaping Needs to be re-done properly
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
-                      eps=1e-5, prepended_text=None, guidance_enabled=True):
+                      eps=1e-5, prepended_text=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    
     if prepended_text is not None:
         pad_id = self.tokenizer.pad_token_id
         # Mask for non-pad elements in the prepended text
-        prefix_mask = (prepended_text != pad_id).to(x.dtype)
-        x = x * (1 - prefix_mask) + prepended_text * prefix_mask
+        self.prefix_mask = (prepended_text != pad_id).to(x.dtype)
+        x = x * (1 - self.prefix_mask) + prepended_text * self.prefix_mask
+
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     
@@ -267,94 +274,97 @@ class MDLMLOO(MDLM):
     return x
   
 
-  def sample_segments(self, x: torch.Tensor, num_loo_segments: int) -> torch.Tensor:
-        """
-        Returns [B, num_loo_segments, num_tokens] tensor where masked tokens are replaced
-        with self.mask_index and unmasked positions keep the original x.
-        """
-        if num_loo_segments == 0 or num_loo_segments is None:
-          return None
-        B, num_tokens = x.shape
-        segments = self.segment_indices.to(x.device)
-        num_segments = len(segments)
-        
-        # Ensure num_loo_segments is not greater than available segments
-        num_loo_segments = min(num_loo_segments, num_segments)
 
-        # Choose random segments
-        chosen_indices = torch.randperm(num_segments, device=x.device)[:num_loo_segments]
-        chosen_segments = segments[chosen_indices]
+  def get_segment_indices(self, p_x0, num_segments):
+      """
+      Create a random contiguous segmentation mask of shape (B, num_segments, segment_length),
+      same random segmentation for all batch elements.
+      """
+      B, segment_length = p_x0.shape
+      device = p_x0.device
 
-        # Shape: [B, num_loo_segments, num_tokens]
-        repeated_x = x.unsqueeze(1).repeat(1, num_loo_segments, 1)
+      cut_points = torch.randperm(segment_length - 1, device=device)[:num_segments - 1] + 1
+      cut_points, _ = torch.sort(cut_points)
 
-        # Shape: [1, num_tokens]
-        token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(0)
+      boundaries = torch.cat([
+          torch.tensor([0], device=device),
+          cut_points,
+          torch.tensor([segment_length], device=device)
+      ])
 
-        # Shape: [num_loo_segments, 1]
-        start_indices = chosen_segments[:, 0].unsqueeze(1)
-        end_indices = chosen_segments[:, 1].unsqueeze(1)
+      pos = torch.arange(segment_length, device=device)
+      segment_ids = torch.bucketize(pos, boundaries[1:], right=False)  # (segment_length,)
 
+      mask = torch.nn.functional.one_hot(segment_ids, num_classes=num_segments).T.bool()
 
-        # Resulting broadcasts to: [num_loo_segments, num_tokens]
-        mask = (token_indices >= start_indices) & (token_indices < end_indices)
+      # we use hard coded amt to do this
+      mask = (self.reshaped_prefix_batch == 0) + (self.reshaped_prefix_batch != 1) * mask
 
-        broadcastable_mask = mask.unsqueeze(0)
+      mask = mask.unsqueeze(0).expand(B, -1, -1)
 
-        mask_value = torch.tensor(self.mask_index, device=x.device, dtype=x.dtype)
+      return mask
 
-        # torch.where broadcasts all inputs to the final shape [B, num_loo_segments, num_tokens]
-        # if it falls in place, set a mask
-        result = torch.where(broadcastable_mask, mask_value, repeated_x)
-
-        return result
-
-  
-
-  def separate_outputs(self, model_output):
-    # Function that will separate by end of text token to
-    # ideally everything has same length so we can batch the process
-    # return indices that should remain masked
-    pass
 
   def random_segmask(self, x, num_loo_segments):
-    # function that will calculate create a random segment mask
-    pass
+      """
+      Creates random segment mask of shape (B, num_segments, segment_length).
+      """
+      with torch.no_grad():
+          mask = self.get_segment_indices(x, num_loo_segments)
+      return mask
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments):
-    # function to compute average gradient on each segment provided
-    pass
+
+  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.3):
+      """
+      Computes average gradient over each random segment and returns mask
+      selecting segments above a threshold.
+      """
+      # 1. Get segmentation mask
+      seg_mask = self.random_segmask(x, num_loo_segments)   # (B, num_segments, segment_length)
+      B, num_segments, L = seg_mask.shape
+
+      grad, _ = self.constraint_function.compute_constraint_grad(x)  # grad: (B, L, vocab_size)
+      mask_index = self.mask_index
+
+      grad_softmax = torch.softmax(grad, dim=-1)  # (B, L, vocab_size)
+
+      grad_mask_token = grad_softmax[:, :, mask_index]  # (B, L)
+      seg_grad_mean = (seg_mask * grad_mask_token.unsqueeze(1)).sum(-1) / seg_mask.sum(-1)  # (B, num_segments)
+
+      avg_grad_mask = seg_grad_mean.mean(0)  # (num_segments,)
+
+      selected_segments = avg_grad_mask > threshold  # (num_segments,)
+
+      selected_mask = seg_mask[:, selected_segments, :]  # (B, num_selected, L)
+      if selected_mask.ndim == 2:
+          # case: only one segment chosen → expand dims for consistent reduction
+          selected_mask = selected_mask.unsqueeze(1)
+
+      final_mask = selected_mask.any(1)  # (B, L)
+      return final_mask  # Boolean mask indicating which positions to re-mask
 
 
-  def _ancestral_update(self, x, t, dt, p_x0=None,
-                          noise_removal_step=False, ):
-    _, alpha_t = self.noise(t)
-    if noise_removal_step:
-      alpha_s = torch.ones_like(alpha_t)
-    else:
-      _, alpha_s = self.noise(t - dt)
-    assert alpha_t.ndim == 2
+  def _ancestral_update(self, x, t, dt, p_x0=None, noise_removal_step=False):
+      _, alpha_t = self.noise(t)
+      alpha_s = torch.ones_like(alpha_t) if noise_removal_step else self.noise(t - dt)[1]
+      assert alpha_t.ndim == 2
 
-    # FORWARD PASS HERE
-    if p_x0 is None:
-      # print("Forward pass count:", self.count)
-      # self.count += 1
-      p_x0 = self.forward(
-        x, self._sigma_from_alphat(alpha_t)).exp()
-      
-      # do a forward here
-      # run reshape p_x0
-      # separate_outputs()
-      # random_segmask()
-      # compute avg gradient mask 
-      # check if I want to px0 to be the gradient
+      if p_x0 is None:
+          p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
 
-    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-    q_xs[:, :, self.mask_index] = 1 - alpha_s
-    _x = sample_categorical(q_xs)
-    
-    copy_flag = (x != self.mask_index).to(x.dtype)
-    return p_x0, copy_flag * x + (1 - copy_flag) * _x
+      # -- Generate gradient-based segment mask --
+      re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_segments, threshold=0.3)
+
+      # Re-mask: replace selected positions with mask token
+      x = torch.where(re_mask, torch.full_like(x, self.mask_index), x)
+
+      # Continue standard update
+      q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+      q_xs[:, :, self.mask_index] = 1 - alpha_s
+      _x = sample_categorical(q_xs)
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      new_x = copy_flag * x + (1 - copy_flag) * _x
+      return new_x
 
 class SEDDAbsorb(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):

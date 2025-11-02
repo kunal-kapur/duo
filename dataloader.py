@@ -600,26 +600,27 @@ def get_dataset(dataset_name,
       return tokens
 
     # ----- Special case for toxicity dataset -----
-    # We want extra padding added *after* each prompt for future fill-ins
     tokens = tokenizer(
-      text,
-      add_special_tokens=False,
-      return_attention_mask=False,
-      return_token_type_ids=False
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_token_type_ids=False
     )
-
-    # Add token-level padding region after each prompt
-    extra_pad_length = 64  # customize this length
+    target_length = 254  # total length including EOS
     pad_id = tokenizer.pad_token_id
-    for i in range(len(tokens['input_ids'])):
-      tokens['input_ids'][i] += [pad_id] * extra_pad_length
-
-    # Optionally add EOS token
-    if insert_eos:
-      tokens['input_ids'] = [t + [EOS] for t in tokens['input_ids']]
-
+    filtered_input_ids = []
+    for seq in tokens['input_ids']:
+        if len(seq) > 150:
+            # Skip this sequence entirely
+            continue
+        max_seq_len = target_length
+        seq = [BOS] + seq
+        seq = seq[:max_seq_len]
+        seq += [pad_id] * (max_seq_len - len(seq))
+        seq += [EOS]
+        filtered_input_ids.append(seq)
+    tokens['input_ids'] = filtered_input_ids
     return tokens
-
 
   if streaming:
     tokenized_dataset = data.map(
