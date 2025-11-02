@@ -5,12 +5,17 @@ from torch.nn import functional as F
 class Constraint:
     def __init__(self, tokenizer, config):
         self.constraint_function = None
-        if config.algo.constraint_function == 'toxicity':
+        if config.algo.get('constraint_function', None) == 'toxicity':
             self.constraint_function= Toxicity(tokenizer)
         return None
 
+    @torch.no_grad()
     def compute_constraint_grad(self, text_chunks):
         return self.constraint_function.compute_toxicity_grad(text_chunks)
+    
+    @torch.no_grad()
+    def evaluate_constraint_text(self, text_chunks, device):
+        return self.constraint_function.evaluate_constraint_text(text_chunks, device)
 
 
 
@@ -18,6 +23,7 @@ class Toxicity:
     def __init__(self, tokenizer=None , device='cuda'):
         if tokenizer is None:
             tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+        tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
         model = RobertaForSequenceClassification.from_pretrained('s-nlp/roberta_toxicity_classifier')
         self.tokenizer = tokenizer
         self.device = device
@@ -26,6 +32,28 @@ class Toxicity:
         self.vocab_size = tokenizer.vocab_size
         self.embed = self.model.get_input_embeddings()  # Roberta embeddings
         self.LEN = 512
+
+    @torch.no_grad()
+    def evaluate_constraint_text(self, text_chunks, device):
+        tokenized = self.tokenizer(
+            text_chunks,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=self.LEN
+        ).to(self.device)
+        return self.evaluate_constraint(tokenized)
+
+    @torch.no_grad()
+    def evaluate_constraint(self, input):
+        """
+        Compute constraint function on this
+        """
+        # Forward pass through model using hidden embeddings
+        outputs = self.model(**input)
+        logits = outputs.logits  # [B, 2]
+        probs = F.softmax(logits, dim=1)
+        return probs
 
     def compute_constraint_grad(self, inputs):
         """

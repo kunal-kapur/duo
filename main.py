@@ -91,13 +91,13 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 # TODO Fix, this config is a mess
 def _generate_samples(diffusion_model, config, logger,
-                      tokenizer, toxic_eval=False):
+                      tokenizer, prepend_data=None, model=None):
   logger.info('Starting Sample Eval.')
-  model = _load_from_checkpoint(
-    diffusion_model=diffusion_model,
-    config=config,
-    tokenizer=tokenizer)
-  
+  if model is None:
+    model = _load_from_checkpoint(
+      diffusion_model=diffusion_model,
+      config=config,
+      tokenizer=tokenizer)
   
   hyperparameters = {
     "steps": config.sampling.steps,
@@ -106,22 +106,6 @@ def _generate_samples(diffusion_model, config, logger,
     hyperparameters['num_loo'] = config.model.num_loo
     hyperparameters['num_segments'] = config.model.num_segments
     hyperparameters['guidance_factor'] = config.model.guidance_factor
-
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
-  # 
-    wandb_logger.log_hyperparams(hyperparameters)
-
-  
-  if toxic_eval is True:
-    toxicity_eval = Toxicity(model_path="/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw")
-    assert config.data.valid == 'toxicity'
-    _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
-
 
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
@@ -145,9 +129,9 @@ def _generate_samples(diffusion_model, config, logger,
       # any text after the first EOS token.
     else:
       prepended_text = None
-      if toxic_eval:
+      if prepend_data is not None:
         # For toxicity eval, we prepend the prompt to the generated samples
-        batch = next(iter(valid_ds))
+        batch = next(iter(prepend_data))
         prepended_text = batch['input_ids'].to(model.device)
       samples = model.restore_model_and_sample(
         num_steps=config.sampling.steps, prepended_text=prepended_text)
@@ -165,21 +149,114 @@ def _generate_samples(diffusion_model, config, logger,
       'generative_ppl': generative_ppl,
       'entropy': entropy
     }
-    if toxic_eval:
-      toxicity_eval = toxicity_eval.compute_toxicity(text_samples)
-      metrics['average_toxicity'] = toxicity_eval.mean().item()
-      print('Average Toxicity:', metrics['average_toxicity'])
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
-    if wandb_logger is not None:
-      wandb_logger.log_metrics(metrics)
-    # print('Average Toxicity:', toxicity_eval.mean().item())
+
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
     json.dump({'generative_ppl': generative_ppl,
                'entropy': entropy,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
+  return metrics, all_samples
+
+
+def _gen_eval(diffusion_model, config, logger, tokenizer):
+    temps_to_use = torch.linspace(.5, 1.0, steps=10).tolist()
+    steps_to_use = [8, 16, 32]
+
+    model = _load_from_checkpoint(
+        diffusion_model=diffusion_model, config=config, tokenizer=tokenizer
+    )
+    hyperparameters = {
+      "steps": config.sampling.steps,
+    }
+
+
+    if config.algo.name == 'mdlm_loo':
+      hyperparameters['num_loo'] = config.algo.num_loo
+      hyperparameters['num_segments'] = config.algo.num_segments
+      hyperparameters['guidance_factor'] = config.algo.guidance_factor
+
+    wandb_logger = None
+    if config.get('wandb', None) is not None:
+      wandb_logger = L.pytorch.loggers.WandbLogger(
+        config=omegaconf.OmegaConf.to_object(config),
+        ** config.wandb)
+    # 
+      wandb_logger.log_hyperparams(hyperparameters)
+
+
+    # model.backbone = torch.compile(model.backbone)
+    total_metadata = {}
+    for steps in steps_to_use:
+        cur_step_info = {}
+        config.sampling.steps = steps
+        for temp in temps_to_use:
+            print("Itearting on ", temp)
+            config.sampling.temperature = temp
+            model.temperature = temp
+            model.metrics.reset()
+            res = _generate_samples(diffusion_model, config, logger, tokenizer, model=model)
+            res['steps'] = steps
+            res['temperature'] = temp
+            cur_step_info[temp] = {
+                "perplexity": res["generative_ppl"],
+                "entropy": res["entropy"],
+            }
+        total_metadata[steps] = cur_step_info
+
+    if wandb_logger is not None:
+        flat_metrics = {
+            f"ppl/steps_{steps}/temp_{temp}": vals["perplexity"]
+            for steps, temps in total_metadata.items()
+            for temp, vals in temps.items()
+        }
+        flat_metrics.update({
+            f"entropy/steps_{steps}/temp_{temp}": vals["entropy"]
+            for steps, temps in total_metadata.items()
+            for temp, vals in temps.items()
+        })
+        wandb_logger.log_metrics(flat_metrics)
+
+    return
+
+def toxic_eval(diffusion_model, config, logger, tokenizer):
+    logger.info('Starting Toxicity Eval.')
+    # Implement toxicity evaluation logic here
+    wandb_logger = None
+    hyperparameters = {
+      "steps": config.sampling.steps,
+    }
+    model = _load_from_checkpoint(
+        diffusion_model=diffusion_model, config=config, tokenizer=tokenizer
+    )
+    if config.get('wandb', None) is not None:
+      wandb_logger = L.pytorch.loggers.WandbLogger(
+        config=omegaconf.OmegaConf.to_object(config),
+        ** config.wandb)
+    # Log hyperparameters
+      wandb_logger.log_hyperparams(hyperparameters)
+
+    assert config.data.valid == 'toxicity' # until I get more constraints
+    print("GETTING DATALOADERS IF NEED BE")
+    _, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer, skip_train=True, valid_seed=config.seed)
+
+      
+    res, samples = _generate_samples(diffusion_model, config, logger,
+                      tokenizer, prepend_data=valid_ds, model=model)
+    samples.append("Fuck all of you. You suck, and I hate you")
+    samples.append("You are so wonderful I love you so much")
+    constraint_model = model.constraint_function
+    toxicity = constraint_model.evaluate_constraint_text(samples, device=model.device)
+    print(toxicity)
+    print("Toxicity eval done", toxicity.shape)
+    print("not toxic", toxicity[:, 0].mean(dim=0).item())
+    toxic_metric = toxicity[:, 1].mean(dim=0).item()
+    print("toxic:", toxic_metric)
+    return
+
 
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
@@ -294,8 +371,11 @@ def main(config):
     _generate_samples(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'gen_eval':
+    _gen_eval(**kwargs)
+
   elif config.mode == 'toxic_eval':
-    _generate_samples(**kwargs, toxic_eval=True)
+    toxic_eval(**kwargs)
 
   else:
     _train(**kwargs)

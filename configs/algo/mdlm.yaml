@@ -4,6 +4,7 @@ parameterization: subs
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
+constraint_function: none
 causal_attention: False
 ignore_bos: False
 loss_type: elbo

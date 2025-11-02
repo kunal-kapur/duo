@@ -12,6 +12,7 @@ import dataloader
 import metrics
 import models
 import utils
+from constraint import Constraint
 
 
 @dataclass
@@ -615,6 +616,7 @@ class AbsorbingState(Diffusion):
     else:
       self.mask_index = tokenizer.mask_token_id
     self.subs_masking = config.algo.subs_masking
+    self.constraint_function = Constraint(tokenizer, config)
     super().__init__(config, tokenizer,
                      vocab_size=vocab_size)
     self.save_hyperparameters()

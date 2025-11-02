@@ -518,6 +518,7 @@ def get_dataset(dataset_name,
       cache_dir=cache_dir,
       streaming=streaming,
       revision=revision)
+    dataset = dataset.filter(lambda x: x['challenging'])
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -606,13 +607,13 @@ def get_dataset(dataset_name,
         return_attention_mask=False,
         return_token_type_ids=False
     )
-    target_length = 254  # total length including EOS
+    target_length = block_size - 1
     pad_id = tokenizer.pad_token_id
     filtered_input_ids = []
     for seq in tokens['input_ids']:
-        if len(seq) > 150:
-            # Skip this sequence entirely
-            continue
+        # if len(seq) > target_length * 0.8:
+        #     # Skip this sequence entirely
+        #     continue
         max_seq_len = target_length
         seq = [BOS] + seq
         seq = seq[:max_seq_len]

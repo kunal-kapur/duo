@@ -5,6 +5,7 @@ time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
 causal_attention: False
+constraint_function: none
 num_segments: 8
 num_loo: 3
 guidance_factor: 1.0

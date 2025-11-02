@@ -205,7 +205,6 @@ class D3PMAbsorb(trainer_base.AbsorbingState):
 
 class MDLMLOO(MDLM):
 
-
   # ASSUME THAT WE CAN DO GENERATION WITH PREPEND TEXT AND CONTROL OUTPUT GENERATION
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
@@ -213,7 +212,6 @@ class MDLMLOO(MDLM):
     self.num_segments = config.algo.num_segments
     self.guidance_factor = config.algo.guidance_factor
     self.num_loo = config.algo.num_loo
-    self.constraint_function = Constraint(tokenizer, config)
     self.graveyard = None
     self.reshaped_prefix_batch = None
 
