@@ -21,6 +21,17 @@ from transformers import RobertaTokenizer, RobertaForSequenceClassification
 # tokenizer = RobertaTokenizer.from_pretrained('s-nlp/roberta_toxicity_classifier')
 # model = RobertaForSequenceClassification.from_pretrained('s-nlp/roberta_toxicity_classifier')
 
+model_dir = "/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw"
+tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+print(tokenizer.vocab_size)
+print(tokenizer.unk_token_id)
+print("unk token", tokenizer.unk_token)
+print(tokenizer.convert_ids_to_tokens(0))
+print(tokenizer.convert_ids_to_tokens(50255))
+print(tokenizer.convert_ids_to_tokens(50256))
+print(tokenizer.convert_ids_to_tokens(50257))
+
 # # Print out the mask token and mask token id
 # print("Mask token:", tokenizer.mask_token)            # Output: '<mask>'
 # print("Mask token id:", tokenizer.mask_token_id)      # Example output: 50264
@@ -94,29 +105,29 @@ class Toxicity:
 
 
 
-# ---- Example usage ----
-toxic_model = Toxicity(device='cpu')
-texts = ["You are amazing and I love you quite a bit!", "Fuck you, I hate you. You suck. Screw you"]
+# # ---- Example usage ----
+# toxic_model = Toxicity(device='cpu')
+# texts = ["You are amazing and I love you quite a bit!", "Fuck you, I hate you. You suck. Screw you"]
 
-tokenized = toxic_model.tokenizer(
-    texts,
-    return_tensors='pt',
-    padding=True,
-    truncation=True,
-    max_length=toxic_model.LEN
+# tokenized = toxic_model.tokenizer(
+#     texts,
+#     return_tensors='pt',
+#     padding=True,
+#     truncation=True,
+#     max_length=toxic_model.LEN
     
-)
+# )
 
-grads, probs = toxic_model.compute_constraint_grad(
-tokenized
-)
+# grads, probs = toxic_model.compute_constraint_grad(
+# tokenized
+# )
 
-print("MASK ID:", toxic_model.tokenizer.mask_token_id)
-print("MMask token", toxic_model.tokenizer.mask_token)
-print("Grads shape:", grads.shape)
-grad_mask = grads[:, :, toxic_model.tokenizer.mask_token_id]
-print("Grad mask", grad_mask, grad_mask.shape)
-print("Probs:", probs)
+# print("MASK ID:", toxic_model.tokenizer.mask_token_id)
+# print("MMask token", toxic_model.tokenizer.mask_token)
+# print("Grads shape:", grads.shape)
+# grad_mask = grads[:, :, toxic_model.tokenizer.mask_token_id]
+# print("Grad mask", grad_mask, grad_mask.shape)
+# print("Probs:", probs)
 
 # text = "Toxic content can appear as <mask>."
 # inputs = tokenizer([text], return_tensors='pt')

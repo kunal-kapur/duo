@@ -385,11 +385,17 @@ class EmbeddingLayer(nn.Module):
     self.embedding = nn.Parameter(torch.empty((vocab_dim, dim)))
     torch.nn.init.kaiming_uniform_(self.embedding, a=math.sqrt(5))
 
-  def forward(self, x, bias=None):
+  def forward(self, x, bias=None, pad_token_id=None, weight=0.1):
     if x.ndim == 2:
-      if bias is not None:
-        return self.embedding[x] - self.embedding[bias]
-      return self.embedding[x]
+        out = self.embedding[x]
+
+        if bias is not None:
+            out = out - weight *self.embedding[bias]
+
+        if pad_token_id is not None:
+            pad_mask = (x == pad_token_id).unsqueeze(-1)
+            out = out.masked_fill(pad_mask, 0.0)
+        return out
     assert x.ndim == 3
     return torch.einsum(
       "blv,ve->ble",
@@ -469,8 +475,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, x, sigma, bias=None):
-    x = self.vocab_embed(x, bias=bias)
+  def forward(self, x, sigma, bias=None, weight=0.1):
+    x = self.vocab_embed(x, bias=bias, weight=weight)
     if self.causal:
       t_cond = None
     else:
