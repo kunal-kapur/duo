@@ -23,7 +23,7 @@ class Constraint:
 
 class Toxicity:
     def __init__(self, tokenizer, device='cuda'):
-        model_dir = "/home/ubuntu/kkapur-v2/models/replaced_vocab_roberta_for_jigsaw"
+        model_dir = "/home/kkapur/models/replaced_vocab_roberta_for_jigsaw"
         model = AutoModelForSequenceClassification.from_pretrained(model_dir)
         model.to(device)
 

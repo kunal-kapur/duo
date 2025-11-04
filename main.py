@@ -245,8 +245,8 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
       
     res, samples = _generate_samples(diffusion_model, config, logger,
                       tokenizer, prepend_data=valid_ds, model=model)
-    samples.append("Fuck all of you. You suck, and I hate you")
-    samples.append("You are so wonderful I love you so much")
+    # samples.append("Fuck all of you. You suck, and I hate you")
+    # samples.append("You are so wonderful I love you so much")
     constraint_model = model.constraint_function
     toxicity = constraint_model.evaluate_constraint_text(samples, device=model.device)
     print(toxicity)

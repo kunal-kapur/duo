@@ -332,7 +332,7 @@ class MDLMLOO(MDLM):
       return mask
 
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.05, temperature=0.001):
+  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.1):
       """
       Compute mask of tokens to re-mask based on normalized negative gradient signal.
       """
@@ -347,11 +347,10 @@ class MDLMLOO(MDLM):
       )  # (B, L, vocab_size)
 
       # 1. Get directional gradient (negative = "push away" signal)
-      grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+      grad_signal = grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+      grad_signal_norm = torch.relu(grad_signal) / temperature
 
-      # 2. Normalize per batch element for stability (temperature-scaled softmax)
-      grad_signal_norm = F.softmax(grad_signal / temperature, dim=-1)
-
+      
       # 3. Compute average normalized gradient per segment
       seg_sum = (seg_mask * grad_signal_norm.unsqueeze(1)).sum(dim=-1)
       seg_count = seg_mask.sum(dim=-1).clamp(min=1)
@@ -368,10 +367,11 @@ class MDLMLOO(MDLM):
 
       # --- Debug print ---
       torch.set_printoptions(precision=3, linewidth=200, threshold=float('inf'))
-      print("=== Normalized negative grad signal (mean per segment) ===")
-      print(seg_mean)
-      print("=== Final re-mask (1 = will be re-masked) ===")
-      print(final_mask.int())
+      # print("=== Normalized negative grad signal (mean per segment) ===")
+      # print(seg_mean)
+      # print("=== Final re-mask (1 = will be re-masked) ===")
+      # print(final_mask.int())
+      # print("Tokens rem per", final_mask.sum(dim=1))
 
       return final_mask
 
@@ -383,11 +383,12 @@ class MDLMLOO(MDLM):
       assert alpha_t.ndim == 2
       if p_x0 is None:
           if self.graveyard is not None:
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor).exp()
+            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id).exp()
           else:
             p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
 
       re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_loo)
+      self.graveyard = self.graveyard * (~re_mask) + x * re_mask
 
       x = torch.where(re_mask, torch.full_like(x, self.mask_index), x)
 

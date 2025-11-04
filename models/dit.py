@@ -386,21 +386,29 @@ class EmbeddingLayer(nn.Module):
     torch.nn.init.kaiming_uniform_(self.embedding, a=math.sqrt(5))
 
   def forward(self, x, bias=None, pad_token_id=None, weight=0.1):
-    if x.ndim == 2:
-        out = self.embedding[x]
+      if x.ndim == 2:
+          out = self.embedding[x]
 
-        if bias is not None:
-            out = out - weight *self.embedding[bias]
+          if bias is not None:
+              bias_emb = self.embedding[bias]
 
-        if pad_token_id is not None:
-            pad_mask = (x == pad_token_id).unsqueeze(-1)
-            out = out.masked_fill(pad_mask, 0.0)
-        return out
-    assert x.ndim == 3
-    return torch.einsum(
-      "blv,ve->ble",
-      torch.nn.functional.softmax(x, dim=-1).float(),
-      self.embedding.float()).to(x.dtype)
+              # Zero out bias contribution where bias == pad_token_id
+              if pad_token_id is not None:
+                  pad_mask = (bias == pad_token_id).unsqueeze(-1)  # [B, L, 1]
+                  bias_emb = bias_emb.masked_fill(pad_mask, 0.0)
+
+              # Apply (possibly masked) bias
+              print("Bias total", "weight", pad_token_id, weight, (weight * bias_emb).sum())
+              out = out - weight * bias_emb
+
+          return out
+
+      assert x.ndim == 3
+      return torch.einsum(
+          "blv,ve->ble",
+          F.softmax(x, dim=-1).float(),
+          self.embedding.float()
+      ).to(x.dtype)
 
 
 class DDiTFinalLayer(nn.Module):
@@ -475,8 +483,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, x, sigma, bias=None, weight=0.1):
-    x = self.vocab_embed(x, bias=bias, weight=weight)
+  def forward(self, x, sigma, bias=None, weight=0.1, pad_token_id=None):
+    x = self.vocab_embed(x, bias=bias, weight=weight, pad_token_id=pad_token_id)
     if self.causal:
       t_cond = None
     else:
