@@ -332,7 +332,7 @@ class MDLMLOO(MDLM):
       return mask
 
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.1):
+  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.001):
       """
       Compute mask of tokens to re-mask based on normalized negative gradient signal.
       """
@@ -371,7 +371,9 @@ class MDLMLOO(MDLM):
       # print(seg_mean)
       # print("=== Final re-mask (1 = will be re-masked) ===")
       # print(final_mask.int())
-      # print("Tokens rem per", final_mask.sum(dim=1))
+      print("Tokens remasked average", final_mask.sum(dim=1).float().mean().item())
+
+
 
       return final_mask
 
@@ -383,12 +385,32 @@ class MDLMLOO(MDLM):
       assert alpha_t.ndim == 2
       if p_x0 is None:
           if self.graveyard is not None:
+            # p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
             p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id).exp()
           else:
             p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
 
       re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_loo)
+
+      # --- Stochastic skip based on timestep (t ~ 1 early, t ~ 0 late) ---
+      if t is not None:
+          # t: [B] going from 1 -> 0
+          B, L = re_mask.shape
+          t_factor = t.view(B, 1)  # expand for broadcasting
+
+          # exponential scaling (higher power -> faster decay)
+          exp_power = 3.0  # you can tune this
+          remask_prob = t_factor ** exp_power
+
+          random_mask = torch.rand_like(re_mask.float()) < remask_prob
+          re_mask = re_mask & random_mask
+
+
+      # Update graveyard
+      print("Tokens remasked average", re_mask.sum(dim=1).float().mean().item())
       self.graveyard = self.graveyard * (~re_mask) + x * re_mask
+
+      # print("Graveyard", self.graveyard)
 
       x = torch.where(re_mask, torch.full_like(x, self.mask_index), x)
 
