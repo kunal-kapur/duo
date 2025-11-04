@@ -103,9 +103,8 @@ def _generate_samples(diffusion_model, config, logger,
     "steps": config.sampling.steps,
   }
   if config.algo.name == 'mdlm_loo':
-    hyperparameters['num_loo'] = config.model.num_loo
-    hyperparameters['num_segments'] = config.model.num_segments
-    hyperparameters['guidance_factor'] = config.model.guidance_factor
+    hyperparameters['num_loo'] = config.algo.num_loo
+    hyperparameters['guidance_factor'] = config.algo.guidance_factor
 
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()

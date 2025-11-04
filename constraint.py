@@ -11,9 +11,9 @@ class Constraint:
             self.constraint_function= Toxicity(tokenizer)
         return None
 
-    @torch.no_grad()
     def compute_constraint_grad(self, input_ids, attention_mask):
-        return self.constraint_function.compute_constraint_grad(input_ids, attention_mask)
+        with torch.enable_grad():
+          return self.constraint_function.compute_constraint_grad(input_ids, attention_mask)
 
     @torch.no_grad()
     def evaluate_constraint_text(self, text_chunks, device):

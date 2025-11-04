@@ -210,9 +210,10 @@ class MDLMLOO(MDLM):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
-    self.num_segments = config.algo.num_segments
-    self.guidance_factor = config.algo.guidance_factor
+    # self.num_segments = config.algo.num_segments
+    # self.guidance_factor = config.algo.guidance_factor
     self.num_loo = config.algo.num_loo
+    self.guidance_factor = config.algo.guidance_factor
     self.reshaped_prefix_batch = None
     self.graveyard = None
 
@@ -242,14 +243,13 @@ class MDLMLOO(MDLM):
     # TODO make parameter in config to adjust the segment probability thresholds
     dt = (1 - eps) / num_steps
     p_x0_cache = None
-    m_t_cache = None
 
     for i in range(num_steps):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ancestral_cache':
         p_x0_cache, x_next = self._ancestral_update(
-          x=x, t=t, dt=dt, p_x0=p_x0_cache, num_loo_segments=self.num_loo)
+          x=x, t=t, dt=dt, p_x0=p_x0_cache)
         
         # print(x_next.shape)
         if (not torch.allclose(x_next, x)
@@ -276,34 +276,51 @@ class MDLMLOO(MDLM):
   
 
 
-  def get_segment_indices(self, p_x0, num_segments):
+  def get_segment_indices(self, x, num_segments):
       """
-      Create a random contiguous segmentation mask of shape (B, num_segments, segment_length),
-      same random segmentation for all batch elements.
+      Create a random contiguous segmentation mask of shape (B, num_segments, L),
+      where each batch element is independently divided into num_segments disjoint
+      contiguous segments of 1's.
+
+      Positions equal to `self.mask_index` or where `self.prefix_mask == 1`
+      are always 0 across all segments.
       """
-      B, segment_length = p_x0.shape
-      device = p_x0.device
+      B, L = x.shape
+      device = x.device
 
-      cut_points = torch.randperm(segment_length - 1, device=device)[:num_segments - 1] + 1
-      cut_points, _ = torch.sort(cut_points)
+      # --- Random segmentation boundaries ---
+      cut_points = torch.sort(
+          torch.rand(B, num_segments - 1, device=device) * (L - 1), dim=-1
+      ).values.long() + 1  # (B, num_segments-1)
+      
+      boundaries = torch.cat(
+          [
+              torch.zeros(B, 1, device=device, dtype=torch.long),
+              cut_points,
+              torch.full((B, 1), L, device=device, dtype=torch.long),
+          ],
+          dim=-1,
+      )  # (B, num_segments+1)
 
-      boundaries = torch.cat([
-          torch.tensor([0], device=device),
-          cut_points,
-          torch.tensor([segment_length], device=device)
-      ])
+      # --- Assign segment ids ---
+      pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
+      segment_ids = torch.sum(pos.unsqueeze(1) >= boundaries[:, :-1].unsqueeze(-1), dim=1) - 1
 
-      pos = torch.arange(segment_length, device=device)
-      segment_ids = torch.bucketize(pos, boundaries[1:], right=False)  # (segment_length,)
+      # --- One-hot encode segments ---
+      mask = torch.nn.functional.one_hot(segment_ids, num_classes=num_segments)  # (B, L, num_segments)
+      mask = mask.permute(0, 2, 1).bool()  # (B, num_segments, L)
 
-      mask = torch.nn.functional.one_hot(segment_ids, num_classes=num_segments).T.bool()
+      # --- Zero out mask tokens and prefix tokens ---
+      mask_positions = (x == self.mask_index).unsqueeze(1)  # (B, 1, L)
+      prefix_positions = (self.prefix_mask == 1).unsqueeze(1)  # (B, 1, L)
+      combined_mask = mask_positions | prefix_positions
 
-      # we use hard coded amt to do this
-      mask = (self.prefix_mask == 0) + (self.prefix_mask != 1) * mask
-
-      mask = mask.unsqueeze(0).expand(B, -1, -1)
-
+      mask = mask & ~combined_mask  # set both to 0
+      torch.set_printoptions(threshold=float('inf'), linewidth=1000)
       return mask
+
+
+
 
 
   def random_segmask(self, x, num_loo_segments):
@@ -315,61 +332,62 @@ class MDLMLOO(MDLM):
       return mask
 
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.3):
+  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.05, temperature=0.001):
       """
-      Compute a mask of tokens to re-mask based on average gradient over non-overlapping segments.
-      Signal is computed with respect to the current tokens.
-      
-      Args:
-          x: (B, L) current token sequence
-          num_loo_segments: number of contiguous segments
-          threshold: average segment signal threshold to select segments
-      
-      Returns:
-          final_mask: (B, L) boolean mask indicating which tokens to re-mask
+      Compute mask of tokens to re-mask based on normalized negative gradient signal.
       """
-      # 1. Get segmentation mask (non-overlapping)
       seg_mask = self.random_segmask(x, num_loo_segments)  # (B, num_segments, L)
       B, num_segments, L = seg_mask.shape
 
-      # Ensure prefix tokens are excluded
-      seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)  # (B, num_segments, L)
+      if hasattr(self, "prefix_mask"):
+          seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)
 
-      # 2. Compute gradient w.r.t. constraint
       grad, _ = self.constraint_function.compute_constraint_grad(
           x, attention_mask=self.curr_attention_mask
       )  # (B, L, vocab_size)
 
-      # 3. Compute token-level signal for current tokens
-      # Use the gradient entry corresponding to the current token
-      grad_signal = -grad.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-      # Negate to indicate direction to reduce constraint
+      # 1. Get directional gradient (negative = "push away" signal)
+      grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
 
-      # 4. Compute average signal per segment
-      seg_lengths = seg_mask.sum(-1).clamp_min(1)  # avoid division by zero (B, num_segments)
-      seg_grad_mean = (seg_mask * grad_signal.unsqueeze(1)).sum(-1) / seg_lengths  # (B, num_segments)
+      # 2. Normalize per batch element for stability (temperature-scaled softmax)
+      grad_signal_norm = F.softmax(grad_signal / temperature, dim=-1)
 
-      # 5. Select segments above threshold
-      selected_segments = seg_grad_mean > threshold  # (B, num_segments)
+      # 3. Compute average normalized gradient per segment
+      seg_sum = (seg_mask * grad_signal_norm.unsqueeze(1)).sum(dim=-1)
+      seg_count = seg_mask.sum(dim=-1).clamp(min=1)
+      seg_mean = seg_sum / seg_count  # (B, num_segments)
 
-      # 6. Expand selection to token-level mask and collapse segments
-      selected_mask = seg_mask & selected_segments.unsqueeze(-1)  # (B, num_segments, L)
-      final_mask = selected_mask.any(1)  # (B, L)
+      # 4. Threshold: segments with strong "violation" pressure
+      high_signal_segments = seg_mean > threshold  # (B, num_segments)
+
+      # 5. Reconstruct token-level mask
+      final_mask = (high_signal_segments.unsqueeze(-1) * seg_mask).sum(dim=1).bool()
+
+      if hasattr(self, "prefix_mask"):
+          final_mask = final_mask & (self.prefix_mask == 0)
+
+      # --- Debug print ---
+      torch.set_printoptions(precision=3, linewidth=200, threshold=float('inf'))
+      print("=== Normalized negative grad signal (mean per segment) ===")
+      print(seg_mean)
+      print("=== Final re-mask (1 = will be re-masked) ===")
+      print(final_mask.int())
 
       return final_mask
+
+
 
   def _ancestral_update(self, x, t, dt, p_x0=None, noise_removal_step=False):
       _, alpha_t = self.noise(t)
       alpha_s = torch.ones_like(alpha_t) if noise_removal_step else self.noise(t - dt)[1]
       assert alpha_t.ndim == 2
-      WEIGHT = 0.1
       if p_x0 is None:
           if self.graveyard is not None:
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=WEIGHT).exp()
+            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor).exp()
           else:
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), weight=WEIGHT).exp()
+            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
 
-      re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_segments, threshold=0.3)
+      re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_loo)
 
       x = torch.where(re_mask, torch.full_like(x, self.mask_index), x)
 
@@ -379,7 +397,7 @@ class MDLMLOO(MDLM):
       copy_flag = (x != self.mask_index).to(x.dtype)
       new_x = copy_flag * x + (1 - copy_flag) * _x
       self.curr_attention_mask = (new_x != self.mask_index).to(x.dtype)
-      return new_x
+      return p_x0, new_x
 
 class SEDDAbsorb(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
