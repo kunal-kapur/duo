@@ -2,7 +2,7 @@
 train: toxicity
 valid: toxicity
 tokenizer_name_or_path: gpt2
-cache_dir: /home/ubuntu/kkapur-v2/data
+cache_dir: /home/kkapur/data
 wrap: False
 streaming: False
 insert_train_eos: False

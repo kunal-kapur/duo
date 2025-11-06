@@ -92,7 +92,7 @@ class Toxicity:
         probs = F.softmax(logits, dim=1)
 
         # Define target = non-toxic (class 1)
-        targets = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        targets = torch.ones(batch_size, dtype=torch.long, device=self.device)
         loss = F.cross_entropy(logits, targets)
 
         # Gradient wrt one-hot token inputs

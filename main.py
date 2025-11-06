@@ -279,8 +279,8 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
         )
         decoded_samples.append(decoded)
     constraint_model = model.constraint_function
-    for i in range(5):
-        print(f"Sample {i}: ", decoded_samples[i])
+    # for i in range(5):
+    #     print(f"Sample {i}: ", decoded_samples[i])
     toxicity = constraint_model.evaluate_constraint_text(decoded_samples, device=model.device)
 
     print("Toxicity eval done", toxicity.shape)

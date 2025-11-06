@@ -332,7 +332,7 @@ class MDLMLOO(MDLM):
       return mask
 
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.001):
+  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.01):
       """
       Compute mask of tokens to re-mask based on normalized negative gradient signal.
       """
@@ -346,8 +346,8 @@ class MDLMLOO(MDLM):
           x, attention_mask=self.curr_attention_mask
       )  # (B, L, vocab_size)
 
-      # 1. Get directional gradient (negative = "push away" signal)
-      grad_signal = grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+      # Get directional gradient
+      grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
       grad_signal_norm = torch.relu(grad_signal) / temperature
 
       
