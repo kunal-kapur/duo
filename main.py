@@ -115,6 +115,11 @@ def _generate_samples(diffusion_model, config, logger,
   num_strides = config.sampling.num_strides
   all_samples = []
   token_samples = []
+  prepend_token_batches = []
+  if prepend_data is not None:
+      prepend_iter = iter(prepend_data)   # <--- create iterator ONCE
+  else:
+      prepend_iter = None
   for _ in range(config.sampling.num_sample_batches):
     if config.sampling.semi_ar:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
@@ -129,12 +134,17 @@ def _generate_samples(diffusion_model, config, logger,
       # any text after the first EOS token.
     else:
       prepended_text = None
-      if prepend_data is not None:
-        # For toxicity eval, we prepend the prompt to the generated samples
-        batch = next(iter(prepend_data))
-        prepended_text = batch['input_ids'].to(model.device)
+      prepended_text = None
+      if prepend_iter is not None:
+        batch = next(prepend_iter)
+        prepend_tokens = batch['input_ids'].to(model.device)
+        prepended_text = prepend_tokens
+        prepend_token_batches.extend(list(prepend_tokens.cpu()))  # <--- record
+
       samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps, prepended_text=prepended_text)
+        num_steps=config.sampling.steps,
+        prepended_text=prepended_text
+      )
       model.metrics.record_entropy(samples)
       token_samples.extend(list(samples.cpu()))
       text_samples = model.tokenizer.batch_decode(samples)
@@ -159,7 +169,7 @@ def _generate_samples(diffusion_model, config, logger,
                'entropy': entropy,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
-  return metrics, token_samples
+  return metrics, token_samples, prepend_token_batches
 
 
 def _gen_eval(diffusion_model, config, logger, tokenizer):
@@ -245,29 +255,34 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=config.seed)
 
       
-    res, generated_tokens = _generate_samples(
+    res, generated_tokens, prepend_tokens = _generate_samples(
         diffusion_model, config, logger, tokenizer,
         prepend_data=valid_ds, model=model
     )
 
     pad_id = tokenizer.pad_token_id
+    prepend_tokens = torch.stack(prepend_tokens, dim=0)   # Ensure B x T tensor
+    generated_tokens = torch.stack(generated_tokens, dim=0)
 
-    prepend_tokens = valid_ds
-
-    pad_mask = (prepend_tokens == pad_id)
+    pad_mask = (prepend_tokens == pad_id)   # B x T boolean mask
 
     batch_generated = []
-    samples = [] 
+    decoded_samples = []
 
     for i in range(generated_tokens.size(0)):
-        gen_i = generated_tokens[i][pad_mask[i]]
-        batch_generated.append(gen_i)
+        continuation = generated_tokens[i][pad_mask[i]]
+        batch_generated.append(continuation)
 
-        text = tokenizer.decode(gen_i, skip_special_tokens=True)
-        samples.append(text)
+        decoded = tokenizer.decode(
+            continuation.tolist(),
+            skip_special_tokens=True
+        )
+        decoded_samples.append(decoded)
     constraint_model = model.constraint_function
-    toxicity = constraint_model.evaluate_constraint_text(samples, device=model.device)
-    print(toxicity)
+    for i in range(5):
+        print(f"Sample {i}: ", decoded_samples[i])
+    toxicity = constraint_model.evaluate_constraint_text(decoded_samples, device=model.device)
+
     print("Toxicity eval done", toxicity.shape)
     print("not toxic", toxicity[:, 0].mean(dim=0).item())
     toxic_metric = toxicity[:, 1].mean(dim=0).item()
