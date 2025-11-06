@@ -44,6 +44,8 @@ class Toxicity:
 
     @torch.no_grad()
     def evaluate_constraint_text(self, text_chunks):
+
+        # this should should add attention mask automatically
         tokenized = self.tokenizer(
             text_chunks,
             return_tensors='pt',

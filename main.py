@@ -114,6 +114,7 @@ def _generate_samples(diffusion_model, config, logger,
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
   all_samples = []
+  token_samples = []
   for _ in range(config.sampling.num_sample_batches):
     if config.sampling.semi_ar:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
@@ -135,6 +136,7 @@ def _generate_samples(diffusion_model, config, logger,
       samples = model.restore_model_and_sample(
         num_steps=config.sampling.steps, prepended_text=prepended_text)
       model.metrics.record_entropy(samples)
+      token_samples.extend(list(samples.cpu()))
       text_samples = model.tokenizer.batch_decode(samples)
       model.metrics.record_generative_perplexity(
         text_samples, config.model.length, model.device)
@@ -157,7 +159,7 @@ def _generate_samples(diffusion_model, config, logger,
                'entropy': entropy,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
-  return metrics, all_samples
+  return metrics, token_samples
 
 
 def _gen_eval(diffusion_model, config, logger, tokenizer):
@@ -243,10 +245,26 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=config.seed)
 
       
-    res, samples = _generate_samples(diffusion_model, config, logger,
-                      tokenizer, prepend_data=valid_ds, model=model)
-    # samples.append("Fuck all of you. You suck, and I hate you")
-    # samples.append("You are so wonderful I love you so much")
+    res, generated_tokens = _generate_samples(
+        diffusion_model, config, logger, tokenizer,
+        prepend_data=valid_ds, model=model
+    )
+
+    pad_id = tokenizer.pad_token_id
+
+    prepend_tokens = valid_ds
+
+    pad_mask = (prepend_tokens == pad_id)
+
+    batch_generated = []
+    samples = [] 
+
+    for i in range(generated_tokens.size(0)):
+        gen_i = generated_tokens[i][pad_mask[i]]
+        batch_generated.append(gen_i)
+
+        text = tokenizer.decode(gen_i, skip_special_tokens=True)
+        samples.append(text)
     constraint_model = model.constraint_function
     toxicity = constraint_model.evaluate_constraint_text(samples, device=model.device)
     print(toxicity)
