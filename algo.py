@@ -332,12 +332,12 @@ class MDLMLOO(MDLM):
       return mask
 
 
-  def compute_avg_gradient_mask(self, x, num_loo_segments, threshold=0.1, temperature=0.01):
+  def compute_avg_gradient(self, x):
       """
       Compute mask of tokens to re-mask based on normalized negative gradient signal.
       """
-      seg_mask = self.random_segmask(x, num_loo_segments)  # (B, num_segments, L)
-      B, num_segments, L = seg_mask.shape
+      # seg_mask = self.random_segmask(x, num_loo_segments)  # (B, num_segments, L)
+      # B, num_segments, L = seg_mask.shape
 
       if hasattr(self, "prefix_mask"):
           seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)
@@ -348,34 +348,8 @@ class MDLMLOO(MDLM):
 
       # Get directional gradient
       grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-      grad_signal_norm = torch.relu(grad_signal) / temperature
+      return grad_signal
 
-      
-      # 3. Compute average normalized gradient per segment
-      seg_sum = (seg_mask * grad_signal_norm.unsqueeze(1)).sum(dim=-1)
-      seg_count = seg_mask.sum(dim=-1).clamp(min=1)
-      seg_mean = seg_sum / seg_count  # (B, num_segments)
-
-      # 4. Threshold: segments with strong "violation" pressure
-      high_signal_segments = seg_mean > threshold  # (B, num_segments)
-
-      # 5. Reconstruct token-level mask
-      final_mask = (high_signal_segments.unsqueeze(-1) * seg_mask).sum(dim=1).bool()
-
-      if hasattr(self, "prefix_mask"):
-          final_mask = final_mask & (self.prefix_mask == 0)
-
-      # --- Debug print ---
-      torch.set_printoptions(precision=3, linewidth=200, threshold=float('inf'))
-      # print("=== Normalized negative grad signal (mean per segment) ===")
-      # print(seg_mean)
-      # print("=== Final re-mask (1 = will be re-masked) ===")
-      # print(final_mask.int())
-      print("Tokens remasked average", final_mask.sum(dim=1).float().mean().item())
-
-
-
-      return final_mask
 
 
 
@@ -390,29 +364,21 @@ class MDLMLOO(MDLM):
           else:
             p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
 
-      re_mask = self.compute_avg_gradient_mask(x, num_loo_segments=self.num_loo)
 
-      # --- Stochastic skip based on timestep (t ~ 1 early, t ~ 0 late) ---
-      if t is not None:
-          # t: [B] going from 1 -> 0
-          B, L = re_mask.shape
-          t_factor = t.view(B, 1)  # expand for broadcasting
+      grad_signal = self.compute_avg_gradient(x)  # (B, L)
+      self.time_decay_exponent = 2.0  # can be made into a config param
+      self.signal_strength = 2.0
+      if grad_signal is not None:
+          remask_prob = torch.sigmoid(grad_signal * self.signal_strength)  # (B, L)
+          
+          # Optionally incorporate timestep modulation (t in [0,1]):
+          remask_prob = remask_prob * (self.curr_timestep ** self.time_decay_exponent)
 
-          # exponential scaling (higher power -> faster decay)
-          exp_power = 3.0  # you can tune this
-          remask_prob = t_factor ** exp_power
-
-          random_mask = torch.rand_like(re_mask.float()) < remask_prob
-          re_mask = re_mask & random_mask
-
-
-      # Update graveyard
-      print("Tokens remasked average", re_mask.sum(dim=1).float().mean().item())
-      self.graveyard = self.graveyard * (~re_mask) + x * re_mask
-
-      # print("Graveyard", self.graveyard)
-
-      x = torch.where(re_mask, torch.full_like(x, self.mask_index), x)
+          # Sample remask decisions:
+          random_vals = torch.rand_like(remask_prob)
+          remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
+          self.graveyard = x * remask_mask + self.graveyard * (~remask_mask)
+          x = torch.where(remask_mask, self.mask_token_id, x)
 
       q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
       q_xs[:, :, self.mask_index] = 1 - alpha_s
