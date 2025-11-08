@@ -216,6 +216,7 @@ class MDLMLOO(MDLM):
     self.guidance_factor = config.algo.guidance_factor
     self.reshaped_prefix_batch = None
     self.graveyard = None
+    self.bias = None
 
 
 
@@ -331,6 +332,31 @@ class MDLMLOO(MDLM):
           mask = self.get_segment_indices(x, num_loo_segments)
       return mask
 
+  def _process_model_output(self, model_output, xt, sigma):
+    del sigma
+    model_output[:, :, self.mask_index] += self.neg_infinity
+
+    if self.bias is not None and self.signal_strength is not None:
+      # DAB-style scaling
+      logit_l2 = torch.norm(model_output, p=2, dim=-1, keepdim=True)
+      bias_l2 = torch.norm(self.bias, p=2, dim=-1, keepdim=True)
+      scaled_bias = self.signal_strength * (logit_l2 / (bias_l2 + 1e-9)) * self.bias
+      model_output = model_output + scaled_bias
+
+    
+    # Normalize the model_output such that x.exp() is
+    # a probability distribution over vocab_size.
+    model_output = model_output - torch.logsumexp(
+      model_output, dim=-1, keepdim=True)
+    # Apply updates directly in the logits matrix.
+    # For the logits of the unmasked tokens, set all values
+    # to -infinity except for the indices corresponding to
+    # the unmasked tokens.
+    unmasked_indices = (xt != self.mask_index)
+    model_output[unmasked_indices] = self.neg_infinity
+    model_output[unmasked_indices, xt[unmasked_indices]] = 0
+    return model_output
+
 
   def compute_avg_gradient(self, x):
       """
@@ -362,32 +388,29 @@ class MDLMLOO(MDLM):
       if p_x0 is None:
           if self.graveyard is not None:
             # p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id)
+            logits = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id)
           else:
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t))
-
-
-          grad_signal = self.compute_avg_gradient(x)  # (B, L)
-          self.time_decay_exponent = 1.0  # can be made into a config param
-          self.signal_strength = 10
-          if grad_signal is not None:
-              p_x0 += grad_signal * self.signal_strength
-              token_grad_signal = grad_signal.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-              remask_prob = torch.sigmoid(token_grad_signal * self.signal_strength - 5)  # (B, L)
-              remask_prob = remask_prob * (t ** self.time_decay_exponent)
-              # Sample remask decisions:
-              random_vals = torch.rand_like(remask_prob)
-              remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
-              # self.graveyard = x * remask_mask + self.graveyard * (~remask_mask)
-              x = torch.where(remask_mask, self.mask_index, x)
-              print("total remasked:", remask_mask.sum().item())
-          p_x0 = p_x0.exp()
+            logits = self.forward(x, self._sigma_from_alphat(alpha_t))
+          p_x0 = logits.exp()
 
       q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
       q_xs[:, :, self.mask_index] = 1 - alpha_s
       _x = sample_categorical(q_xs)
       copy_flag = (x != self.mask_index).to(x.dtype)
       new_x = copy_flag * x + (1 - copy_flag) * _x
+      grad_signal = self.compute_avg_gradient(_x)  # (B, L)
+      self.time_decay_exponent = 1.0  # can be made into a config param
+      self.signal_strength = 50.0
+      if grad_signal is not None:
+          self.bias = grad_signal
+          token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+          remask_prob = torch.tanh(token_grad_signal * self.signal_strength).clamp(min=0)  # (B, L)
+          remask_prob = remask_prob * (t ** self.time_decay_exponent)
+          random_vals = torch.rand_like(remask_prob)
+          remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
+          new_x = torch.where(remask_mask, self.mask_index, new_x)
+          print("total remasked:", remask_mask.sum().item())
+          p_x0 = logits.exp()
       self.curr_attention_mask = (new_x != self.mask_index).to(x.dtype)
       return p_x0, new_x
 
