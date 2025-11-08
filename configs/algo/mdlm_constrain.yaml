@@ -1,0 +1,12 @@
+name: mdlm_constrain
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: subs
+time_conditioning: False
+T: 0  # 0 (continuous time) / 1000 
+subs_masking: False
+causal_attention: False
+constraint_function: none
+time_decay: 1.0  # can be made into a config param
+signal_strength: 10.0
+ignore_bos: False
+loss_type: elbo

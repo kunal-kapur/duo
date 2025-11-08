@@ -102,10 +102,6 @@ def _generate_samples(diffusion_model, config, logger,
   hyperparameters = {
     "steps": config.sampling.steps,
   }
-  if config.algo.name == 'mdlm_loo':
-    hyperparameters['num_loo'] = config.algo.num_loo
-    hyperparameters['guidance_factor'] = config.algo.guidance_factor
-
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
   if config.eval.disable_ema:
@@ -253,7 +249,6 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
     print("GETTING DATALOADERS IF NEED BE")
     _, valid_ds = dataloader.get_dataloaders(
     config, tokenizer, skip_train=True, valid_seed=config.seed)
-
       
     res, generated_tokens, prepend_tokens = _generate_samples(
         diffusion_model, config, logger, tokenizer,
@@ -380,6 +375,8 @@ def main(config):
     diffusion_model = algo.MDLM
   elif config.algo.name == 'mdlm_loo':
     diffusion_model = algo.MDLMLOO
+  elif config.algo.name == 'mdlm_constrain':
+    diffusion_model = algo.MDLMConstrain
   elif config.algo.name == 'duo_base':
     diffusion_model = algo.DUO_BASE
   elif config.algo.name == 'd3pm':

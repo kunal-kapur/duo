@@ -204,7 +204,7 @@ class D3PMAbsorb(trainer_base.AbsorbingState):
     diffusion_loss = self.T * L_vb_masked * (xt == self.mask_index)
     return self._reconstruction_loss(x0) + diffusion_loss
 
-class MDLMLOO(MDLM):
+class MDLMConstrain(MDLM):
 
   # ASSUME THAT WE CAN DO GENERATION WITH PREPEND TEXT AND CONTROL OUTPUT GENERATION
   def __init__(self, config, tokenizer):
@@ -212,11 +212,11 @@ class MDLMLOO(MDLM):
     self._validate_configuration()
     # self.num_segments = config.algo.num_segments
     # self.guidance_factor = config.algo.guidance_factor
-    self.num_loo = config.algo.num_loo
-    self.guidance_factor = config.algo.guidance_factor
-    self.reshaped_prefix_batch = None
     self.graveyard = None
     self.bias = None
+    print("HERE")
+    self.time_decay = config.algo.time_decay
+    self.signal_strength = config.algo.signal_strength
 
 
 
@@ -334,16 +334,14 @@ class MDLMLOO(MDLM):
 
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
+    # Block mask token
     model_output[:, :, self.mask_index] += self.neg_infinity
 
     if self.bias is not None and self.signal_strength is not None:
-      # DAB-style scaling
-      logit_l2 = torch.norm(model_output, p=2, dim=-1, keepdim=True)
-      bias_l2 = torch.norm(self.bias, p=2, dim=-1, keepdim=True)
-      scaled_bias = self.signal_strength * (logit_l2 / (bias_l2 + 1e-9)) * self.bias
-      model_output = model_output + scaled_bias
+      # Max-normalize bias for interpretable scaling
+      # normalized_bias = self.bias / (self.bias.abs().max() + 1e-8)
+      model_output = model_output + (self.bias * self.signal_strength)
 
-    
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
     model_output = model_output - torch.logsumexp(
@@ -357,26 +355,13 @@ class MDLMLOO(MDLM):
     model_output[unmasked_indices, xt[unmasked_indices]] = 0
     return model_output
 
-
   def compute_avg_gradient(self, x):
-      """
-      Compute mask of tokens to re-mask based on normalized negative gradient signal.
-      """
-      # seg_mask = self.random_segmask(x, num_loo_segments)  # (B, num_segments, L)
-      # B, num_segments, L = seg_mask.shape
-
-      # if hasattr(self, "prefix_mask"):
-      #     seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)
-
       grad, _ = self.constraint_function.compute_constraint_grad(
           x, attention_mask=self.curr_attention_mask
-      )  # (B, L, vocab_size)
-
-      # Get directional gradient
-      grad[:, :, self.mask_index] = 0  # zero out mask token grad
-      return -grad
-      # grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-      # return grad_signal
+      )
+      grad[:, :, self.mask_index] = 0
+      normed_grad = grad / (grad.abs().max() + 1e-8)
+      return -normed_grad
 
 
 
@@ -386,11 +371,7 @@ class MDLMLOO(MDLM):
       alpha_s = torch.ones_like(alpha_t) if noise_removal_step else self.noise(t - dt)[1]
       assert alpha_t.ndim == 2
       if p_x0 is None:
-          if self.graveyard is not None:
-            # p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
-            logits = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id)
-          else:
-            logits = self.forward(x, self._sigma_from_alphat(alpha_t))
+          logits = self.forward(x, self._sigma_from_alphat(alpha_t))
           p_x0 = logits.exp()
 
       q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
@@ -398,18 +379,22 @@ class MDLMLOO(MDLM):
       _x = sample_categorical(q_xs)
       copy_flag = (x != self.mask_index).to(x.dtype)
       new_x = copy_flag * x + (1 - copy_flag) * _x
-      grad_signal = self.compute_avg_gradient(_x)  # (B, L)
-      self.time_decay_exponent = 1.0  # can be made into a config param
-      self.signal_strength = 50.0
+      self.threshold_offset = 2.0
+      grad_signal = self.compute_avg_gradient(x)
       if grad_signal is not None:
           self.bias = grad_signal
-          token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-          remask_prob = torch.tanh(token_grad_signal * self.signal_strength).clamp(min=0)  # (B, L)
-          remask_prob = remask_prob * (t ** self.time_decay_exponent)
-          random_vals = torch.rand_like(remask_prob)
-          remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
+          token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)
+          
+          # remask_prob = torch.tanh(token_grad_signal * self.signal_strength).clamp(min=0.0)
+          remask_prob = torch.sigmoid(
+              token_grad_signal * self.signal_strength - self.threshold_offset
+          )
+          remask_prob = remask_prob * (t ** self.time_decay)
+          remask_mask = torch.rand_like(remask_prob) < remask_prob
+          remask_mask = remask_mask & (self.prefix_mask == 0) & (new_x != self.mask_index)
           new_x = torch.where(remask_mask, self.mask_index, new_x)
           print("total remasked:", remask_mask.sum().item())
+          logits = self._process_model_output(logits, new_x, sigma=None)
           p_x0 = logits.exp()
       self.curr_attention_mask = (new_x != self.mask_index).to(x.dtype)
       return p_x0, new_x
