@@ -339,16 +339,18 @@ class MDLMLOO(MDLM):
       # seg_mask = self.random_segmask(x, num_loo_segments)  # (B, num_segments, L)
       # B, num_segments, L = seg_mask.shape
 
-      if hasattr(self, "prefix_mask"):
-          seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)
+      # if hasattr(self, "prefix_mask"):
+      #     seg_mask = seg_mask & (self.prefix_mask == 0).unsqueeze(1)
 
       grad, _ = self.constraint_function.compute_constraint_grad(
           x, attention_mask=self.curr_attention_mask
       )  # (B, L, vocab_size)
 
       # Get directional gradient
-      grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
-      return grad_signal
+      grad[:, :, self.mask_index] = 0  # zero out mask token grad
+      return -grad
+      # grad_signal = -grad.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+      # return grad_signal
 
 
 
@@ -360,25 +362,26 @@ class MDLMLOO(MDLM):
       if p_x0 is None:
           if self.graveyard is not None:
             # p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id).exp()
+            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t), bias=self.graveyard, weight=self.guidance_factor, pad_token_id=self.tokenizer.pad_token_id)
           else:
-            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t)).exp()
+            p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t))
 
 
-      grad_signal = self.compute_avg_gradient(x)  # (B, L)
-      self.time_decay_exponent = 2.0  # can be made into a config param
-      self.signal_strength = 2.0
-      if grad_signal is not None:
-          remask_prob = torch.sigmoid(grad_signal * self.signal_strength)  # (B, L)
-          
-          # Optionally incorporate timestep modulation (t in [0,1]):
-          remask_prob = remask_prob * (self.curr_timestep ** self.time_decay_exponent)
-
-          # Sample remask decisions:
-          random_vals = torch.rand_like(remask_prob)
-          remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
-          self.graveyard = x * remask_mask + self.graveyard * (~remask_mask)
-          x = torch.where(remask_mask, self.mask_token_id, x)
+          grad_signal = self.compute_avg_gradient(x)  # (B, L)
+          self.time_decay_exponent = 1.0  # can be made into a config param
+          self.signal_strength = 10
+          if grad_signal is not None:
+              p_x0 += grad_signal * self.signal_strength
+              token_grad_signal = grad_signal.gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (B, L)
+              remask_prob = torch.sigmoid(token_grad_signal * self.signal_strength - 5)  # (B, L)
+              remask_prob = remask_prob * (t ** self.time_decay_exponent)
+              # Sample remask decisions:
+              random_vals = torch.rand_like(remask_prob)
+              remask_mask = random_vals < remask_prob  # boolean mask for remasking tokens
+              # self.graveyard = x * remask_mask + self.graveyard * (~remask_mask)
+              x = torch.where(remask_mask, self.mask_index, x)
+              print("total remasked:", remask_mask.sum().item())
+          p_x0 = p_x0.exp()
 
       q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
       q_xs[:, :, self.mask_index] = 1 - alpha_s
