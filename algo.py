@@ -218,8 +218,6 @@ class MDLMConstrain(MDLM):
     self.time_decay = config.algo.time_decay
     self.signal_strength = config.algo.signal_strength
 
-
-
   # VERY scuffed and lot of hard-coding. Reshaping Needs to be re-done properly
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
@@ -321,9 +319,6 @@ class MDLMConstrain(MDLM):
       return mask
 
 
-
-
-
   def random_segmask(self, x, num_loo_segments):
       """
       Creates random segment mask of shape (B, num_segments, segment_length).
@@ -338,9 +333,11 @@ class MDLMConstrain(MDLM):
     model_output[:, :, self.mask_index] += self.neg_infinity
 
     if self.bias is not None and self.signal_strength is not None:
-      # Max-normalize bias for interpretable scaling
-      # normalized_bias = self.bias / (self.bias.abs().max() + 1e-8)
-      model_output = model_output + (self.bias * self.signal_strength)
+        # Compute a scaling factor from the magnitude of the logits per batch/token position
+        magnitude = model_output.abs().max(dim=-1, keepdim=True)[0]  # shape: (B, L, 1)
+        scaled_bias = self.bias * magnitude * self.signal_strength
+        model_output = model_output - scaled_bias
+
 
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
@@ -361,7 +358,7 @@ class MDLMConstrain(MDLM):
       )
       grad[:, :, self.mask_index] = 0
       normed_grad = grad / (grad.abs().max() + 1e-8)
-      return -normed_grad
+      return normed_grad
 
 
 
@@ -386,6 +383,7 @@ class MDLMConstrain(MDLM):
           token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)
           
           # remask_prob = torch.tanh(token_grad_signal * self.signal_strength).clamp(min=0.0)
+          # positive tokens 
           remask_prob = torch.sigmoid(
               token_grad_signal * self.signal_strength - self.threshold_offset
           )
