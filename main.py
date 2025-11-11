@@ -112,6 +112,7 @@ def _generate_samples(diffusion_model, config, logger,
   all_samples = []
   token_samples = []
   prepend_token_batches = []
+  prompt_lengths_batches = []
   if prepend_data is not None:
       prepend_iter = iter(prepend_data)   # <--- create iterator ONCE
   else:
@@ -129,24 +130,36 @@ def _generate_samples(diffusion_model, config, logger,
       # and diffusion.compute_generative_perplexity() discards
       # any text after the first EOS token.
     else:
-      prepended_text = None
-      prepended_text = None
-      if prepend_iter is not None:
-        batch = next(prepend_iter)
-        prepend_tokens = batch['input_ids'].to(model.device)
-        prepended_text = prepend_tokens
-        prepend_token_batches.extend(list(prepend_tokens.cpu()))  # <--- record
+        prepended_text = None
+        prompt_lengths = None
+        if prepend_iter is not None:
+            batch = next(prepend_iter)
+            prepend_tokens = batch['input_ids'].to(model.device)
+            prepended_text = prepend_tokens
+            prepend_token_batches.extend(list(prepend_tokens.cpu()))
+            # Store lengths
+            prompt_lengths = [len(seq) for seq in prepend_tokens]
+            prompt_lengths_batches.extend(prompt_lengths)
 
-      samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps,
-        prepended_text=prepended_text
-      )
-      model.metrics.record_entropy(samples)
-      token_samples.extend(list(samples.cpu()))
-      text_samples = model.tokenizer.batch_decode(samples)
-      model.metrics.record_generative_perplexity(
-        text_samples, config.model.length, model.device)
-      all_samples.extend(list(text_samples))
+        samples = model.restore_model_and_sample(
+            num_steps=config.sampling.steps,
+            prepended_text=prepended_text
+        )
+        model.metrics.record_entropy(samples)
+        token_samples.extend(list(samples.cpu()))
+        text_samples = model.tokenizer.batch_decode(samples)
+
+        # Use conditional recording, only apply masking if there are prepend tokens
+        if prepended_text is not None and len(prompt_lengths) > 0:
+            model.metrics.record_generative_perplexity(
+                text_samples, config.model.length, model.device,
+                prompt_lengths=prompt_lengths
+            )
+        else:
+            model.metrics.record_generative_perplexity(
+                text_samples, config.model.length, model.device
+            )
+        all_samples.extend(list(text_samples))
   generative_ppl = 0.
   entropy = 0.
   if not config.sampling.semi_ar:
