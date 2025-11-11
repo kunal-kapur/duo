@@ -227,7 +227,6 @@ class MDLMConstrain(MDLM):
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
-    
     if prepended_text is not None:
         pad_id = self.tokenizer.pad_token_id
         # Mask for non-pad elements in the prepended text
@@ -333,11 +332,10 @@ class MDLMConstrain(MDLM):
     model_output[:, :, self.mask_index] += self.neg_infinity
 
     if self.bias is not None and self.signal_strength is not None:
-        # Compute a scaling factor from the magnitude of the logits per batch/token position
-        magnitude = model_output.abs().max(dim=-1, keepdim=True)[0]  # shape: (B, L, 1)
-        scaled_bias = self.bias * magnitude * self.signal_strength
+        # Assuming self.bias is shape (B, L, V)
+        l2_norm = self.bias.norm(dim=-1, keepdim=True)  # shape: (B, L, 1)
+        scaled_bias = self.bias * l2_norm * self.signal_strength  # or, if you want to shift all logits
         model_output = model_output - scaled_bias
-
 
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
@@ -357,6 +355,8 @@ class MDLMConstrain(MDLM):
           x, attention_mask=self.curr_attention_mask
       )
       grad[:, :, self.mask_index] = 0
+      mask = self.prefix_mask.bool().unsqueeze(-1).expand_as(grad)  # (B, L, V)
+      grad[mask] = 0
       normed_grad = grad / (grad.abs().max() + 1e-8)
       return normed_grad
 
@@ -370,32 +370,38 @@ class MDLMConstrain(MDLM):
       if p_x0 is None:
           logits = self.forward(x, self._sigma_from_alphat(alpha_t))
           p_x0 = logits.exp()
-
+      
       q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
       q_xs[:, :, self.mask_index] = 1 - alpha_s
       _x = sample_categorical(q_xs)
       copy_flag = (x != self.mask_index).to(x.dtype)
       new_x = copy_flag * x + (1 - copy_flag) * _x
-      self.threshold_offset = 2.0
-      grad_signal = self.compute_avg_gradient(x)
+
+      grad_signal = self.compute_avg_gradient(x)  # shape: B x L x V
+      if self.bias is None:
+          self.bias = torch.zeros_like(grad_signal)
       if grad_signal is not None:
-          self.bias = grad_signal
-          token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)
-          
-          # remask_prob = torch.tanh(token_grad_signal * self.signal_strength).clamp(min=0.0)
-          # positive tokens 
-          remask_prob = torch.sigmoid(
-              token_grad_signal * self.signal_strength - self.threshold_offset
-          )
-          remask_prob = remask_prob * (t ** self.time_decay)
-          remask_mask = torch.rand_like(remask_prob) < remask_prob
-          remask_mask = remask_mask & (self.prefix_mask == 0) & (new_x != self.mask_index)
+          # self.bias = grad_signal
+          self.bias = self.bias * 0.5 + grad_signal # this somewhat may change things
+          token_grad_signal = -grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)  # shape: B x L
+          # print(token_grad_signal)
+          constraint_weights = torch.softmax(token_grad_signal, dim=-1)  # B x L
+          sigma_t = t ** self.time_decay
+          sigma_t = sigma_t * torch.ones_like(token_grad_signal)  # B x L
+
+          remask_prob = sigma_t * constraint_weights * self.signal_strength
+          remask_prob = remask_prob.clamp(0.0, 1.0)
+
+          remask_mask = (torch.rand_like(remask_prob) < remask_prob) & (self.prefix_mask == 0) & (new_x != self.mask_index)
           new_x = torch.where(remask_mask, self.mask_index, new_x)
           print("total remasked:", remask_mask.sum().item())
+
           logits = self._process_model_output(logits, new_x, sigma=None)
           p_x0 = logits.exp()
       self.curr_attention_mask = (new_x != self.mask_index).to(x.dtype)
       return p_x0, new_x
+
+
 
 class SEDDAbsorb(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
