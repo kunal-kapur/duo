@@ -231,17 +231,16 @@ def _gen_eval(diffusion_model, config, logger, tokenizer):
 def toxic_eval(diffusion_model, config, logger, tokenizer):
     logger.info('Starting Toxicity Eval.')
 
-    # temps_to_use = torch.linspace(0.5, 1.0, steps=5).tolist()
-    # steps_to_use = [16, 32, 64, 128]
-    temps_to_use = [0.7]
-    steps_to_use = [128]
+    temps_to_use = torch.linspace(0.5, 1.0, steps=5).tolist()
+    steps_to_use = [16, 32, 64, 128]
 
     model = _load_from_checkpoint(
         diffusion_model=diffusion_model, config=config, tokenizer=tokenizer
     )
 
     hyperparameters = {
-        "num_samples": config.sampling.num_sample_batches * config.loader.eval_batch_size
+        "num_samples": config.sampling.num_sample_batches * config.loader.eval_batch_size,
+        "model_length": config.model.length
     }
 
 
