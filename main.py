@@ -230,59 +230,101 @@ def _gen_eval(diffusion_model, config, logger, tokenizer):
 
 def toxic_eval(diffusion_model, config, logger, tokenizer):
     logger.info('Starting Toxicity Eval.')
-    # Implement toxicity evaluation logic here
-    wandb_logger = None
-    hyperparameters = {
-      "steps": config.sampling.steps,
-    }
+
+    temps_to_use = torch.linspace(0.5, 1.0, steps=10).tolist()
+    steps_to_use = [8, 16, 32]
+
     model = _load_from_checkpoint(
         diffusion_model=diffusion_model, config=config, tokenizer=tokenizer
     )
-    if config.get('wandb', None) is not None:
-      wandb_logger = L.pytorch.loggers.WandbLogger(
-        config=omegaconf.OmegaConf.to_object(config),
-        ** config.wandb)
-    # Log hyperparameters
-      wandb_logger.log_hyperparams(hyperparameters)
 
-    assert config.data.valid == 'toxicity' # until I get more constraints
-    print("GETTING DATALOADERS IF NEED BE")
+    hyperparameters = {
+        "steps": config.sampling.steps,
+    }
+
+    if config.algo.name == 'mdlm_constrain':
+        hyperparameters['time_decay'] = config.algo.time_decay
+        hyperparameters['signal_strength'] = config.algo.signal_strength
+
+    wandb_logger = None
+    if config.get('wandb', None) is not None:
+        wandb_logger = L.pytorch.loggers.WandbLogger(
+            config=omegaconf.OmegaConf.to_object(config),
+            **config.wandb
+        )
+        wandb_logger.log_hyperparams(hyperparameters)
+
+    assert config.data.valid == 'toxicity'  # until I get more constraints
+
+    # Load the validation dataset once
+    print("GETTING DATALOADERS")
     _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
-      
-    res, generated_tokens, prepend_tokens = _generate_samples(
-        diffusion_model, config, logger, tokenizer,
-        prepend_data=valid_ds, model=model
+        config, tokenizer, skip_train=True, valid_seed=config.seed
     )
 
     pad_id = tokenizer.pad_token_id
-    prepend_tokens = torch.stack(prepend_tokens, dim=0)   # Ensure B x T tensor
-    generated_tokens = torch.stack(generated_tokens, dim=0)
-
-    pad_mask = (prepend_tokens == pad_id)   # B x T boolean mask
-
-    batch_generated = []
-    decoded_samples = []
-
-    for i in range(generated_tokens.size(0)):
-        continuation = generated_tokens[i][pad_mask[i]]
-        batch_generated.append(continuation)
-
-        decoded = tokenizer.decode(
-            continuation.tolist(),
-            skip_special_tokens=True
-        )
-        decoded_samples.append(decoded)
     constraint_model = model.constraint_function
-    # for i in range(5):
-    #     print(f"Sample {i}: ", decoded_samples[i])
-    toxicity = constraint_model.evaluate_constraint_text(decoded_samples, device=model.device)
 
-    print("Toxicity eval done", toxicity.shape)
-    print("not toxic", toxicity[:, 0].mean(dim=0).item())
-    toxic_metric = toxicity[:, 1].mean(dim=0).item()
-    print("toxic:", toxic_metric)
+    for steps in steps_to_use:
+        config.sampling.steps = steps
+
+        for temp in temps_to_use:
+            print(f"Evaluating steps={steps}, temp={temp}")
+            config.sampling.temperature = temp
+            model.temperature = temp
+            model.metrics.reset()
+
+            # Generate samples
+            res, generated_tokens, prepend_tokens = _generate_samples(
+                diffusion_model, config, logger, tokenizer,
+                prepend_data=valid_ds, model=model
+            )
+
+            # Process tokens to extract continuations
+            prepend_tokens = torch.stack(prepend_tokens, dim=0)
+            generated_tokens = torch.stack(generated_tokens, dim=0)
+            pad_mask = (prepend_tokens == pad_id)
+
+            batch_generated = []
+            decoded_samples = []
+
+            for i in range(generated_tokens.size(0)):
+                continuation = generated_tokens[i][pad_mask[i]]
+                batch_generated.append(continuation)
+                decoded = tokenizer.decode(
+                    continuation.tolist(),
+                    skip_special_tokens=True
+                )
+                decoded_samples.append(decoded)
+
+            # Evaluate toxicity
+            toxicity = constraint_model.evaluate_constraint_text(
+                decoded_samples, device=model.device
+            )
+
+            # Calculate metrics
+            pct_not_toxic = toxicity[:, 0].mean(dim=0).item()
+            pct_toxic = toxicity[:, 1].mean(dim=0).item()
+
+            print(f"  Perplexity: {res['generative_ppl']:.4f}")
+            print(f"  Entropy: {res['entropy']:.4f}")
+            print(f"  % Not Toxic: {pct_not_toxic:.4f}")
+            print(f"  % Toxic: {pct_toxic:.4f}")
+
+            # Log metrics for current hyperparameter set
+            if wandb_logger is not None:
+                wandb_logger.log_metrics({
+                    "steps": steps,
+                    "temperature": temp,
+                    "perplexity": res["generative_ppl"],
+                    "entropy": res["entropy"],
+                    "pct_not_toxic": pct_not_toxic,
+                    "pct_toxic": pct_toxic,
+                })
+
+    print("Metrics logged to wandb (per hyperparameters set)")
     return
+
 
 
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
