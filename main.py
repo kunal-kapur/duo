@@ -130,7 +130,6 @@ def _generate_samples(diffusion_model, config, logger,
       # any text after the first EOS token.
     else:
       prepended_text = None
-      prepended_text = None
       if prepend_iter is not None:
         batch = next(prepend_iter)
         prepend_tokens = batch['input_ids'].to(model.device)
@@ -261,17 +260,33 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
     # Load the validation dataset once
     print("GETTING DATALOADERS")
     _, valid_ds = dataloader.get_dataloaders(
-        config, tokenizer, skip_train=True, valid_seed=config.seed
+        config, tokenizer, skip_train=True, valid_seed=None
     )
+    it1 = iter(valid_ds)
+    it2 = iter(valid_ds)
+
+    for _ in range(5):
+        b1 = next(it1)['input_ids']
+        b2 = next(it2)['input_ids']
+        assert torch.equal(b1, b2), "Validation DataLoader is NOT deterministic!"
+    print("Validation loader order is deterministic.")
 
     pad_id = tokenizer.pad_token_id
     constraint_model = model.constraint_function
+    base_samples_path = config.eval.generated_samples_path
+    sample_counter = 0
 
     for steps in steps_to_use:
         config.sampling.steps = steps
 
         for temp in temps_to_use:
-            print(f"Evaluating steps={steps}, temp={temp}")
+            sample_counter += 1
+            paths = os.path.split(base_samples_path)
+            modified = paths[-2] + "-" + str(sample_counter)
+            config.eval.generated_samples_path = os.path.join(
+                paths[0], modified, paths[-1]
+            )
+            print(f"Evaluating steps={steps}, temp={temp} saving to {config.eval.generated_samples_path}")
             config.sampling.temperature = temp
             model.temperature = temp
             model.metrics.reset()
@@ -281,7 +296,6 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
                 diffusion_model, config, logger, tokenizer,
                 prepend_data=valid_ds, model=model
             )
-
             # Process tokens to extract continuations
             prepend_tokens = torch.stack(prepend_tokens, dim=0)
             generated_tokens = torch.stack(generated_tokens, dim=0)
@@ -290,13 +304,30 @@ def toxic_eval(diffusion_model, config, logger, tokenizer):
             batch_generated = []
             decoded_samples = []
 
+            decoded_prepend = []
+
+
+            # sanity check to make sure they are decoded correctly
+
+            # for i in range(prepend_tokens.size(0)):
+            #     prepended = prepend_tokens[i][~pad_mask[i]]
+            #     decoded_prep = tokenizer.decode(
+            #         prepended.tolist(),
+            #         skip_special_tokens=True
+            #     )
+            #     print("Before decoding:", prepended.tolist())
+            #     print("After decoding:", decoded_prep)
+            #     decoded_prepend.append(decoded_prep)
+            print("-----" * 10)
             for i in range(generated_tokens.size(0)):
+                # continuation = generated_tokens[i] # this is continutaion with everything, print as sanity check to make sure prompt is there
                 continuation = generated_tokens[i][pad_mask[i]]
                 batch_generated.append(continuation)
                 decoded = tokenizer.decode(
                     continuation.tolist(),
                     skip_special_tokens=True
                 )
+                # print("Decoded result", decoded[0:50])
                 decoded_samples.append(decoded)
 
             # Evaluate toxicity
