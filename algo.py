@@ -273,70 +273,16 @@ class MDLMConstrain(MDLM):
     return x
   
 
-
-  def get_segment_indices(self, x, num_segments):
-      """
-      Create a random contiguous segmentation mask of shape (B, num_segments, L),
-      where each batch element is independently divided into num_segments disjoint
-      contiguous segments of 1's.
-
-      Positions equal to `self.mask_index` or where `self.prefix_mask == 1`
-      are always 0 across all segments.
-      """
-      B, L = x.shape
-      device = x.device
-
-      # --- Random segmentation boundaries ---
-      cut_points = torch.sort(
-          torch.rand(B, num_segments - 1, device=device) * (L - 1), dim=-1
-      ).values.long() + 1  # (B, num_segments-1)
-      
-      boundaries = torch.cat(
-          [
-              torch.zeros(B, 1, device=device, dtype=torch.long),
-              cut_points,
-              torch.full((B, 1), L, device=device, dtype=torch.long),
-          ],
-          dim=-1,
-      )  # (B, num_segments+1)
-
-      # --- Assign segment ids ---
-      pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
-      segment_ids = torch.sum(pos.unsqueeze(1) >= boundaries[:, :-1].unsqueeze(-1), dim=1) - 1
-
-      # --- One-hot encode segments ---
-      mask = torch.nn.functional.one_hot(segment_ids, num_classes=num_segments)  # (B, L, num_segments)
-      mask = mask.permute(0, 2, 1).bool()  # (B, num_segments, L)
-
-      # --- Zero out mask tokens and prefix tokens ---
-      mask_positions = (x == self.mask_index).unsqueeze(1)  # (B, 1, L)
-      prefix_positions = (self.prefix_mask == 1).unsqueeze(1)  # (B, 1, L)
-      combined_mask = mask_positions | prefix_positions
-
-      mask = mask & ~combined_mask  # set both to 0
-      torch.set_printoptions(threshold=float('inf'), linewidth=1000)
-      return mask
-
-
-  def random_segmask(self, x, num_loo_segments):
-      """
-      Creates random segment mask of shape (B, num_segments, segment_length).
-      """
-      with torch.no_grad():
-          mask = self.get_segment_indices(x, num_loo_segments)
-      return mask
-
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
     # Block mask token
-    model_output[:, :, self.mask_index] += self.neg_infinity
-
     if self.bias is not None and self.signal_strength is not None:
         # Assuming self.bias is shape (B, L, V)
-        l2_norm = self.bias.norm(dim=-1, keepdim=True)  # shape: (B, L, 1)
+        l2_norm = model_output.norm(dim=-1, keepdim=True)  # shape: (B, L, 1)
         scaled_bias = self.bias * l2_norm * self.signal_strength  # or, if you want to shift all logits
         model_output = model_output - scaled_bias
-
+        
+    model_output[:, :, self.mask_index] += self.neg_infinity
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
     model_output = model_output - torch.logsumexp(
@@ -357,10 +303,9 @@ class MDLMConstrain(MDLM):
       grad[:, :, self.mask_index] = 0
       mask = self.prefix_mask.bool().unsqueeze(-1).expand_as(grad)  # (B, L, V)
       grad[mask] = 0
-      normed_grad = grad / (grad.abs().max() + 1e-8)
+      norm = grad.norm(dim=-1, keepdim=True)  # over vocab dimension only
+      normed_grad = grad / (norm + 1e-8)
       return normed_grad
-
-
 
 
   def _ancestral_update(self, x, t, dt, p_x0=None, noise_removal_step=False):
@@ -381,17 +326,13 @@ class MDLMConstrain(MDLM):
       if self.bias is None:
           self.bias = torch.zeros_like(grad_signal)
       if grad_signal is not None:
-          # self.bias = grad_signal
-          self.bias = self.bias * 0.5 + grad_signal # this somewhat may change things
-          token_grad_signal = -grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)  # shape: B x L
-          # print(token_grad_signal)
-          constraint_weights = torch.softmax(token_grad_signal, dim=-1)  # B x L
+          self.bias = self.bias * 0.5 + grad_signal
+          token_grad_signal = grad_signal.gather(dim=-1, index=new_x.unsqueeze(-1)).squeeze(-1)
+          eta_conf = torch.softmax(token_grad_signal, dim=-1)  # B x L  # confidence-based weighting
           sigma_t = t ** self.time_decay
           sigma_t = sigma_t * torch.ones_like(token_grad_signal)  # B x L
-
-          remask_prob = sigma_t * constraint_weights * self.signal_strength
+          remask_prob = eta_conf * sigma_t * self.signal_strength  # B x L
           remask_prob = remask_prob.clamp(0.0, 1.0)
-
           remask_mask = (torch.rand_like(remask_prob) < remask_prob) & (self.prefix_mask == 0) & (new_x != self.mask_index)
           new_x = torch.where(remask_mask, self.mask_index, new_x)
           print("total remasked:", remask_mask.sum().item())
