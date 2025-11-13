@@ -131,15 +131,11 @@ def _generate_samples(diffusion_model, config, logger,
       # any text after the first EOS token.
     else:
         prepended_text = None
-        prompt_lengths = None
         if prepend_iter is not None:
             batch = next(prepend_iter)
             prepend_tokens = batch['input_ids'].to(model.device)
             prepended_text = prepend_tokens
             prepend_token_batches.extend(list(prepend_tokens.cpu()))
-            # Store lengths
-            prompt_lengths = [len(seq) for seq in prepend_tokens]
-            prompt_lengths_batches.extend(prompt_lengths)
 
         samples = model.restore_model_and_sample(
             num_steps=config.sampling.steps,
@@ -150,10 +146,9 @@ def _generate_samples(diffusion_model, config, logger,
         text_samples = model.tokenizer.batch_decode(samples)
 
         # Use conditional recording, only apply masking if there are prepend tokens
-        if prepended_text is not None and len(prompt_lengths) > 0:
+        if prepended_text is not None:
             model.metrics.record_generative_perplexity(
-                text_samples, config.model.length, model.device,
-                prompt_lengths=prompt_lengths
+                text_samples, config.model.length, model.device
             )
         else:
             model.metrics.record_generative_perplexity(
